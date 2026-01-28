@@ -34,7 +34,7 @@ tubeX tubeY tubeZ diskX diskY diskZ'.split(' ')
          model.child(n).identity().move(col - 2.5, row - 2.5, 0)
 	               .turnX(.5 * model.time)
 	               .turnY(.8 * model.time)
-	               .scale(.25);
+	               .scale(.35);
       }
    });
 }

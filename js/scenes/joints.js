@@ -26,7 +26,7 @@ export const init = async model => {
 	      .turnZ(Math.cos(2*model.time)/2);
 
       elbow.identity()
-            .move(1,0,0)
-	    .turnZ(Math.sin(2*model.time)*.7+.7);
+           .move(1,0,0)
+	   .turnZ(Math.sin(2*model.time)*.7+.7);
    });
 }
