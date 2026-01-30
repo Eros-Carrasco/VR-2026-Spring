@@ -1,6 +1,6 @@
 // ===== GLOBAL PARAMS =====
 
-let mapSize = 25;
+let mapSize = 6;
 let spacing = 1;
 let seed = 10;
 let frequency = 0.1;
@@ -16,6 +16,8 @@ function noise(x, z) {
 // ===== MAIN =====
 
 export const init = async model => {
+
+  model.move(0, 0.5, -.5).scale(0.04);
 
   // TEXTURES
   model.txtrSrc(1, '../media/eros/textures/water.png');

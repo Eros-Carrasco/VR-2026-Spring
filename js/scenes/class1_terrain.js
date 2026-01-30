@@ -1,10 +1,10 @@
 // ===== GLOBAL PARAMS =====
 
-let mapSize = 15;
+let mapSize = 8;
 let spacing = 1;
 let seed = 10;
 let frequency = 0.1;
-let heightScale = 7;
+let heightScale = 15;
 
 let movingSpeed = 0.03;
 
@@ -16,6 +16,8 @@ function noise(x, z) {
 // ===== MAIN =====
 
 export const init = async model => {
+
+  model.move(0, 0.5, -.5).scale(0.05);
 
   model.txtrSrc(1, '../media/eros/textures/water.png');
   model.txtrSrc(2, '../media/eros/textures/sand.png');
@@ -48,9 +50,9 @@ export const init = async model => {
       let h = noise(nx, nz) * heightScale;
 
       let tex = 3;
-      if (h < 1) tex = 1;
-      else if (h < 2) tex = 2;
-      else if (h > 4) tex = 4;
+      if (h < 3) tex = 1;
+      else if (h < 6) tex = 2;
+      else if (h > 11) tex = 4;
 
       model.child(c.i)
         .identity()
