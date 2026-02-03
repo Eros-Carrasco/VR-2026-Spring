@@ -4,7 +4,8 @@ Software for CSCI-GA.3033-​097 Virtual Reality 2026 Spring.
 
 # How to setup the environment
 
-install Node.js and npm if you haven't. Then in the command line, do
+install Node.js and npm if you haven't. This project was tested using **Node v18.20.8**; if you run into issues, we recommend switching to this version.
+Then in the command line, do
 ```sh
 npm install
 cd server

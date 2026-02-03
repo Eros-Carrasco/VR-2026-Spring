@@ -1,14 +1,16 @@
-// Create objects with a variety of shapes,
-// apply color and texture to each object, and
-// animate object position, rotation and scale.
+/*
+   This scene creates objects with a variety of shapes,
+   applies color and texture to each object,
+   and animates object position, rotation and scale.
+*/
 
 export const init = async model => {
 
-   // Assign a texture slot to a source image.
+   // ASSIGN A TEXTURE SLOT TO A TEXTURE SOURCE IMAGE.
 
    model.txtrSrc(1, '../media/textures/brick.png');
 
-   // Various predefined shapes.
+   // VARIOUS PREDEFINED SHAPES.
 
    let shapes = '\
 coneX coneY coneZ cube cube,rounded cubeXZ \
@@ -16,7 +18,7 @@ pyramidX pyramidY pyramidZ ringX ringY ringZ \
 sphere square octahedron torusX torusY torusZ \
 tubeX tubeY tubeZ diskX diskY diskZ'.split(' ') 
 
-   // Create objects, and add colors and textures.
+   // CREATE OBJECTS, AND ADD COLORS AND TEXTURES.
 
    for (let n = 0 ; n < shapes.length ; n++)
       model.add(shapes[n]);
@@ -25,7 +27,7 @@ tubeX tubeY tubeZ diskX diskY diskZ'.split(' ')
    for (let n = 1 ; n < shapes.length ; n += 2)
       model.child(n).color(1.23*n%1,2.34*n%1,3.45*n%1);
 
-   // At every animation frame, arrange and rotate objects.
+   // AT EVERY ANIMATION FRAME, PLACE AND ROTATE OBJECTS.
 
    model.move(0,1.8,0).scale(.4).animate(() => {
       for (let n = 0 ; n < shapes.length ; n++) {

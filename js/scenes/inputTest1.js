@@ -1,3 +1,14 @@
+/*
+   This is a very simple example of how to use the
+   inputEvents object.
+
+   When the scene is in XR mode, the x position of
+   the left controller controls the red component
+   of the cube's color, and the x position of the
+   right controller controls the blue component of
+   the cube's color.
+*/
+
 export const init = async model => {
    let obj1 = model.add('cube');
 

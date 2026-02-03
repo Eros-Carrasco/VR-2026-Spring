@@ -1,13 +1,15 @@
-// Create and animate hierarchical joints.
+/*
+   Create and animate hierarchical joints.
+*/
 
 export const init = async model => {
 
-   // Create nodes with no shapes as joints for animation.
+   // CREATE NODES WITH NO SHAPES AS JOINTS FOR ANIMATION.
 
    let shoulder = model.add();
    let elbow    = shoulder.add();
 
-   // Create and place shapes that will move with each joint.
+   // CREATE AND PLACE SHAPES THAT WILL MOVE WITH EACH JOINT.
 
    shoulder.add('tubeZ').scale(.2,.2,.13).color(0,0,1);
    shoulder.add('tubeX').move(.5,0,0).scale(.5,.1,.1);
@@ -16,7 +18,7 @@ export const init = async model => {
    elbow.add('tubeX').move(.5,0,0).scale(.5,.08,.08);
    elbow.add('sphere').move(1,0,0).scale(.16).color(1,0,0);
 
-   // Animate the joints over time.
+   // ANIMATE THE JOINTS OVER TIME.
 
    model.move(0,1.5,0).scale(.4).animate(() => {
 
