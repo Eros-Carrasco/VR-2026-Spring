@@ -1,4 +1,4 @@
-let scale = [.1, .1, .1];
+let scale = [.4, .4, .4];
 let color = [.5, .5, .5];
 
 let posL = [0, 0, 0];
