@@ -454,6 +454,7 @@ precision highp float; // HIGH PRECISION FLOATS
  uniform int uWhitescreen;
  uniform int uSky;
  uniform int uTriangleDisk;
+ uniform int uUdf1, uUdf2;
  uniform int uViewIndex;
  uniform vec3 uEye, uViewPosition;
 
@@ -588,6 +589,19 @@ vec3 lighting_contribution(
        );
     }
 #else    
+    if (uUdf1 == 1 || uUdf2 == 1) {
+       vec4 rgba;
+       if (uUdf1 == 1) rgba = txtrLogic(texture(uSampler[13],uv), ambient);
+       if (uUdf2 == 1) rgba = txtrLogic(texture(uSampler[14],uv), ambient);
+       float d = max(1.2, length(vPos) / length(uModel[1]) * 1.57);
+       d += 5. * max(0., d - 7.) * (d - 7.);
+       float opacity = pow(rgba.r, 40. / pow(d,.2 - float(uUdf2))) / pow(d,.25);
+       if (opacity < .01)
+          discard;
+       fragColor = vec4(diffuse, opacity * uOpacity);
+       return;
+    }
+  
     vec3 ambientColor   = ambient;
     vec3 diffuseColor   = diffuse;
     vec3 specularColor  = specular.rgb;

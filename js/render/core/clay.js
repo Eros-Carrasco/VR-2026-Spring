@@ -333,6 +333,53 @@ export function Clay(gl, canvas) {
       this.defineMesh(name, mesh);
    }
 
+   this.text = (text, isFont2) => {
+      const inch = 0.0254;
+
+      let charQuad = (col, row, ch) => {
+         let i, j, x0, y0, x1, y1, u0, v0, u1, v1;
+
+         x0 =  col * inch/2; x1 = x0 + inch/2;
+         y0 = -row * inch  ; y1 = y0 - inch  ;
+
+	 if (isFont2) {
+            i = ch % 11; j = ch / 11 >> 0;
+            u0 = .005 + (i+1.0/3.5) / 11.1; v0 = (j+.2) / 9;
+            u1 = .005 + (i+2.5/3.5) / 11.1; v1 = (j+.8) / 9;
+	 }
+	 else {
+            i = ch % 10; j = ch / 10 >> 0;
+            u0 = (i+1/4) / 10; v0 =  j    / 10;
+            u1 = (i+3/4) / 10; v1 = (j+1) / 10;
+         }
+
+	 let add = (a,b) =>
+	    V.push(clay.vertexArray([a ? x1 : x0, b ? y1 : y0,0],
+				    [0,0,1], [1,0,0],
+				    [a ? u1 : u0, b ? v1 : v0]));
+         add(0,1); add(1,1); add(0,0);
+         add(0,0); add(1,1); add(1,0);
+      }
+
+      let V = [], col = 0, row = 0;
+      for (let n = 0 ; n < text.length ; n++) {
+         let charCode = text.charCodeAt(n);
+         switch (charCode) {
+         case  9: col += 8 - col % 8; break;       // tab
+         case 10: row++; col = 0; break;           // newline
+	 case 32: col++; break;                    // space
+         default: charQuad(col++, row, charCode - 32); break;
+         }
+      }
+
+      let mesh = new Float32Array(V.flat());
+      mesh.isTriangles = true;
+      mesh.isFont2 = isFont2;
+      let typeName = 'udfText' + (1000 * Math.random() >> 0);
+      this.defineMesh(typeName, mesh);
+      return typeName;
+   }
+
 let M = new cg.Matrix();
 
 //////////////////////////////////////////////////////////////////////////////////////////////
@@ -2449,6 +2496,14 @@ function Node(_form) {
       this.dataTree.children.push(child.dataTree);
       if (form == 'label')
          child.txtrSrc(15, 'media/textures/fixed-width-font.png');
+      if (form && form.indexOf('udfText') == 0) {
+         if (! window._udf_font_isLoaded) {
+            child.txtrSrc(13, 'media/textures/udf-font1.png');
+            child.txtrSrc(14, 'media/textures/udf-font2.png');
+            window._udf_font_isLoaded = true;
+         }
+         child.flag(clay.formMesh(form).isFont2 ? 'uUdf2' : 'uUdf1');
+      }
       return child;
    }
 
