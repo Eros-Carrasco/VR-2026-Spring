@@ -8,23 +8,30 @@ export const init = async model => {
 
    model.txtrSrc(1, '../media/textures/water_vase.jpg');
    model.txtrSrc(2, '../media/textures/brick.png');
+   model.txtrSrc(3, '../media/textures/moon_diffuse.jpg');
+   model.txtrSrc(4, '../media/eros/textures/grass.png');
 
 
    // MAKE A RED BALL.
 
-   let ball = model.add('sphere').color('red');
-   // let sky = model.add('square').color('lightblue');
-   let floor = model.add('cube').color('cyan');
-   floor.move(0, -0.55, 0).scale(1, 0.05, 1);
+   let ball = model.add('sphere');
+   ball.txtr(3); 
 
-   let leftWall = model.add('cube').txtr(1);
+   let floor = model.add('cube');
+   floor.move(0, -0.55, 0).scale(1, 0.05, 1);
+   floor.txtr(4);
+
+   let leftWall = model.add('cube');
+   leftWall.txtr(1);
    leftWall.move(-0.57, 0, 0).scale(0.1, 1, 1);
 
-   let rightWall = model.add('cube').txtr(2);
+   let rightWall = model.add('cube');
+   rightWall.txtr(2);
    rightWall.move(0.57, 0, 0).scale(0.1, 1, 1);
 
-   let backWall = model.add('square').color('white');
-   backWall.move(0, 0, -5).scale(10);
+   let sky = model.add('square');
+   sky.color(0.53, 0.81, 0.92)
+   sky.move(0, 0, -5).scale(10);
 
 
    // INITIALIZE POSITION, VELOCITY AND GRAVITY.
