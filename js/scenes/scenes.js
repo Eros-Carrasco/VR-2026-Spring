@@ -18,6 +18,7 @@ export default () => {
          { name: "text1"        , path: "./text1.js"        , public: true },
          { name: "text2"        , path: "./text2.js"        , public: true },
          { name: "text3"        , path: "./text3.js"        , public: true },
+         { name: "text4"        , path: "./text4.js"        , public: true },
       ]
    };
 }
