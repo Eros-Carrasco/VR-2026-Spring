@@ -594,8 +594,12 @@ vec3 lighting_contribution(
        if (uUdf1 == 1) rgba = txtrLogic(texture(uSampler[13],uv), ambient);
        if (uUdf2 == 1) rgba = txtrLogic(texture(uSampler[14],uv), ambient);
        float d = max(1.2, length(vPos) / length(uModel[1]) * 1.57);
-       d += 5. * max(0., d - 7.) * (d - 7.);
-       float opacity = pow(rgba.r, 40. / pow(d,.2 - float(uUdf2))) / pow(d,.25);
+       //d += 5. * max(0., d - 7.) * (d - 7.);
+
+       float opacity;
+       if (uUdf1 == 1) opacity = pow(rgba.r, 10. / pow(d,2.)) / pow(d,.25);
+       if (uUdf2 == 1) opacity = pow(rgba.r, 30. / pow(d,.9)) / pow(d,.25);
+
        if (opacity < .01)
           discard;
        fragColor = vec4(diffuse, opacity * uOpacity);

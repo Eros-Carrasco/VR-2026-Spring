@@ -101,6 +101,27 @@
       return s;
    }
 
+   // Split text into multiple lines after a given line length.
+
+   export let split = (textIn, n) => {
+      let textOut = '';
+      let k = 0, count = 0, j, ch;
+      for (let i = 0 ; i < textIn.length ; i++) {
+	 if (++count == n) {
+	    for (j = i ; j > 1 ; j--)
+	       if ((ch = textIn.charAt(j-1)) == ' ' || ch == '-')
+	          break;
+            textOut = textOut.substring(0, textOut.length + j-i) + '\n';
+            i = j;
+	    count = 0;
+         }
+	 if ((ch = textIn.charAt(i)) == '\n')
+	    count = 0;
+         textOut += ch;
+      }
+      return textOut;
+   }
+
    // Rounded string representations of a floating point value
 
    export let round = (t,n) => {
