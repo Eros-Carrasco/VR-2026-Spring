@@ -14,5 +14,5 @@ export const init = async model => {
             model.add(myText).move(x+.29,1.9-.1*n,z).color(0,0,0).scale(.1);
       }
    });
-}
+} 
 
