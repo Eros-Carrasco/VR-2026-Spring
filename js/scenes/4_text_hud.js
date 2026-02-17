@@ -13,11 +13,11 @@ export const init = async model => {
       .then(data => {
          let tempC = data.current_weather.temperature;
          let windKmh = data.current_weather.windspeed;
-         
-         let tempF = (tempC * 9/5 + 32).toFixed(1);
-         let windMph = (windKmh / 1.60934).toFixed(1);
 
-         weatherStr = `${tempC}°C (${tempF}°F) | Wind: ${windKmh} km/h (${windMph} mph)`;
+         let tempF = (tempC * 9 / 5 + 32).toFixed(0);
+         let windMph = (windKmh / 1.60934).toFixed(0);
+
+         weatherStr = `${tempC}C (${tempF}F) | Wind: ${windKmh} km/h (${windMph} mph)`;
       })
       .catch(err => { weatherStr = "Weather offline"; });
 
@@ -30,7 +30,7 @@ export const init = async model => {
 
       // Controls coordinates
       let rightText = "Right Controller: (N/A, N/A, N/A)";
-      let leftText  = "Left Controller:  (N/A, N/A, N/A)";
+      let leftText = "Left Controller:  (N/A, N/A, N/A)";
 
 
       if (clay && clay.controllerWidgets) {
@@ -62,7 +62,22 @@ export const init = async model => {
 
       let myText = clay.text(dynamicString, true);
 
-      model.add('square').move(-.4, 1.75, -.01).scale(.3, .2, 1).color(0, 0.1, 0.2).opacity(0.8);
-      model.add(myText).move(-.55, 1.8, 0).color(0, 1, 0.5).scale(.6);
+      let smartwatch = model.add();
+
+      // Fondo azul
+      smartwatch.add('square').move(0, 0, -0.01).scale(.85, .4, 1).color(0, 0.1, 0.2).opacity(0.8);
+      // Texto verde
+      smartwatch.add(myText).move(-.80, 0.3, 0).color(0, 1, 0.5).scale(2.8);
+
+      if (clay && clay.controllerWidgets && clay.controllerWidgets.left) {
+
+         smartwatch.setMatrix(clay.controllerWidgets.left.getMatrix());
+
+         smartwatch.move(0, 4, -2).turnX(-0.8).scale(5);
+
+      } else {
+         smartwatch.move(0, 1.5, 0).scale(0.8);
+      }
+
    });
 }
