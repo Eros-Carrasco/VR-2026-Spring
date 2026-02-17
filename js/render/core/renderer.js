@@ -454,7 +454,7 @@ precision highp float; // HIGH PRECISION FLOATS
  uniform int uWhitescreen;
  uniform int uSky;
  uniform int uTriangleDisk;
- uniform int uUdf1, uUdf2;
+ uniform int uUdf1, uUdf2, uUdf3;
  uniform int uViewIndex;
  uniform vec3 uEye, uViewPosition;
 
@@ -589,16 +589,27 @@ vec3 lighting_contribution(
        );
     }
 #else    
-    if (uUdf1 == 1 || uUdf2 == 1) {
+    if (uUdf1 == 1 || uUdf2 == 1 || uUdf3 == 1) {
        vec4 rgba;
-       if (uUdf1 == 1) rgba = txtrLogic(texture(uSampler[13],uv), ambient);
-       if (uUdf2 == 1) rgba = txtrLogic(texture(uSampler[14],uv), ambient);
+       if (uUdf1 == 1) rgba = txtrLogic(texture(uSampler[12],uv), ambient);
+       if (uUdf2 == 1) rgba = txtrLogic(texture(uSampler[13],uv), ambient);
+       if (uUdf3 == 1) rgba = txtrLogic(texture(uSampler[14],uv), ambient);
        float d = max(1.2, length(vPos) / length(uModel[1]) * 1.57);
-       //d += 5. * max(0., d - 7.) * (d - 7.);
 
        float opacity;
        if (uUdf1 == 1) opacity = pow(rgba.r, 10. / pow(d,2.)) / pow(d,.25);
+
        if (uUdf2 == 1) opacity = pow(rgba.r, 30. / pow(d,.9)) / pow(d,.25);
+
+       if (uUdf3 == 1) {
+          float u = rgba.r;
+          float v = rgba.b;
+	  float w = max(0., min(1., 1. - d * d / 400.));
+	  w = pow(w, mix(1.,16.,max(0.,2.*w-1.)));
+          opacity = w < .8 ? max(pow(v, pow(3., 5. * w)), .4 - w)
+	                   : mix(u, pow(v, 81.), 5. - 5. * w);
+          opacity *= w > .5 ? mix(.5, 1., pow(2.*w-1.,2.)) : .35 + .6 * w * w;
+       }
 
        if (opacity < .01)
           discard;
