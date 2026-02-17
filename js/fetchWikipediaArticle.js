@@ -15,8 +15,20 @@ export async function fetchWikipediaArticle(title, callback) {
       const pages = data.query.pages;
       const pageId = Object.keys(pages)[0];
       callback(pages[pageId].extract);
-   } catch (error) {
-      console.error("Could not fetch article: ", error);
-      document.getElementById('article-content').textContent = 'Failed to load article.';
-   }
+   } catch (error) { callback(null); }
+}
+
+export async function fetchWikipediaFullArticle(title, callback) {
+   let url = `https://en.wikipedia.org/w/api.php?action=query&format=json\
+&origin=*&titles=${encodeURIComponent(title)}&prop=extracts&explaintext`;
+   try {
+      let response = await fetch(url);
+      if (! response.ok)
+         throw new Error();
+      let data = await response.json();
+      let pages = data.query.pages;
+      let pageId = Object.keys(pages)[0];
+      let extract = pages[pageId].extract;
+      callback(extract);
+   } catch (error) { callback(null); }
 }

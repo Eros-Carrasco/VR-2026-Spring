@@ -21,6 +21,9 @@ export default () => {
          { name: "text4"        , path: "./text4.js"        , public: true },
          { name: "text5"        , path: "./text5.js"        , public: true },
          { name: "text6"        , path: "./text6.js"        , public: true },
+         { name: "text7"        , path: "./text7.js"        , public: true },
+         { name: "master1"      , path: "./master1.js"      , public: true },
+         { name: "bouncing"     , path: "./bouncing.js"     , public: true },
       ]
    };
 }

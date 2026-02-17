@@ -2,7 +2,7 @@ import { texts } from "../util/texts.js";
 
 export const init = async model => {
    model.animate(() => {
-      let myText = clay.text(texts[5], true);
+      let myText = clay.text(texts[5]);
       while (model.nChildren())
          model.remove(0);
       for (let t = 0 ; t < 2 ; t++) {
