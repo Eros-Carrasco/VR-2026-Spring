@@ -1,43 +1,30 @@
 // Variables globales
 let socket = null;
+let latestDetections = [];
 let hudCanvas = null;
 let ctx = null;
-let latestDetections = [];
 
-// --- INIT: Arranca el sistema de visión ---
+// Constantes de tu servidor de Python (captura)
+const SERVER_WIDTH = 1280;
+const SERVER_HEIGHT = 720;
+
 export const init = async (model) => {
-    console.log("👁️ [Vision System] Iniciando escena...");
+    console.log("👁️ [Vision System] Iniciando HUD con Textura 2D...");
 
-    // 1. Crear HUD (Heads-Up Display)
-    hudCanvas = document.getElementById('vision-hud'); // Cambio de nombre de ID
+    // 1. Crear el Canvas 2D (Se mantiene oculto, solo sirve para dibujar)
     if (!hudCanvas) {
         hudCanvas = document.createElement('canvas');
-        hudCanvas.id = 'vision-hud';
-        hudCanvas.style.position = 'absolute';
-        hudCanvas.style.top = '0';
-        hudCanvas.style.left = '0';
-        hudCanvas.style.width = '100%';
-        hudCanvas.style.height = '100%';
-        hudCanvas.style.pointerEvents = 'none'; 
-        hudCanvas.style.zIndex = '1000'; 
-        document.body.appendChild(hudCanvas);
+        hudCanvas.width = SERVER_WIDTH;
+        hudCanvas.height = SERVER_HEIGHT;
+        ctx = hudCanvas.getContext('2d');
     }
-    ctx = hudCanvas.getContext('2d');
-
-    const resizeHud = () => {
-        hudCanvas.width = window.innerWidth;
-        hudCanvas.height = window.innerHeight;
-    };
-    window.addEventListener('resize', resizeHud);
-    resizeHud();
 
     // 2. Conexión WebSocket
     if (!socket || socket.readyState === WebSocket.CLOSED) {
-        // Conecta al nuevo servidor vision_server.py
-        socket = new WebSocket('ws://localhost:8000/ws');
+        socket = new WebSocket('ws://10.20.85.30:8000/ws');
 
-        socket.onopen = () => console.log("✅ [Vision System] Conectado al servidor RT-DETR");
-        
+        socket.onopen = () => console.log("✅ [Vision System] Conectado al servidor");
+
         socket.onmessage = (event) => {
             try {
                 latestDetections = JSON.parse(event.data);
@@ -47,39 +34,41 @@ export const init = async (model) => {
         socket.onerror = (e) => console.error("❌ [Vision System] Error de conexión:", e);
     }
 
-    // 3. Render Loop
+    // 3. Render Loop (3D)
     model.animate(() => {
-        if (ctx) ctx.clearRect(0, 0, hudCanvas.width, hudCanvas.height);
-        if (latestDetections.length === 0) return;
+        // A. Limpiar el canvas 2D en cada frame
+        ctx.clearRect(0, 0, hudCanvas.width, hudCanvas.height);
 
-        // Ajustar escala (Asumiendo servidor 1280x720)
-        const SERVER_WIDTH = 1280;
-        const SERVER_HEIGHT = 720;
-        const scaleX = hudCanvas.width / SERVER_WIDTH;
-        const scaleY = hudCanvas.height / SERVER_HEIGHT;
+        // B. Dibujar las cajas verdes exactas en el Canvas 2D
+        if (latestDetections.length > 0) {
+            latestDetections.forEach(obj => {
+                const { label, bbox } = obj;
+                const [x1, y1, x2, y2] = bbox;
 
-        latestDetections.forEach(obj => {
-            const { label, bbox } = obj;
-            const [x1, y1, x2, y2] = bbox;
+                // Cajas
+                ctx.strokeStyle = '#00FF00';
+                ctx.lineWidth = 6;
+                ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
 
-            const sx = x1 * scaleX;
-            const sy = y1 * scaleY;
-            const sw = (x2 - x1) * scaleX;
-            const sh = (y2 - y1) * scaleY;
+                // Texto
+                ctx.font = 'bold 36px Arial';
+                ctx.fillStyle = '#00FF00';
+                ctx.fillText(label.toUpperCase(), x1, y1 - 10);
+            });
+        }
 
-            // Estilo visual "Cyberpunk" limpio
-            ctx.strokeStyle = '#00FF00';
-            ctx.lineWidth = 2;
-            ctx.strokeRect(sx, sy, sw, sh);
+        // C. Limpiar la escena 3D anterior
+        while (model.nChildren()) {
+            model.remove(0);
+        }
 
-            ctx.font = 'bold 16px Arial';
-            const textW = ctx.measureText(label).width;
-            
-            ctx.fillStyle = '#00FF00';
-            ctx.fillRect(sx, sy - 22, textW + 8, 22);
-            
-            ctx.fillStyle = 'black';
-            ctx.fillText(label.toUpperCase(), sx + 4, sy - 5);
-        });
+        // D. Crear UN SOLO plano 3D y pegarle el canvas como textura
+        if (latestDetections.length > 0) {
+            model.add('square')
+                .move(0, 0, -1.5)     // Centrado frente a tu vista, a 1.5 metros
+                .scale(1.6, 0.9, 0)   // Proporción 16:9 (igual que 1280x720)
+                .texture(hudCanvas)   // <-- Posible ajuste de sintaxis aquí
+                .opacity(0.9);
+        }
     });
 };
