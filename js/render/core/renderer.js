@@ -608,7 +608,7 @@ vec3 lighting_contribution(
 	  w = pow(w, mix(1.,16.,max(0.,2.*w-1.)));
           opacity = w < .8 ? max(pow(v, pow(3., 5. * w)), .4 - w)
 	                   : mix(u, pow(v, 81.), 5. - 5. * w);
-          opacity *= w > .5 ? mix(.5, 1., pow(2.*w-1.,2.)) : .35 + .6 * w * w;
+	  opacity *= .5 + .5 * w;
        }
 
        if (opacity < .01)

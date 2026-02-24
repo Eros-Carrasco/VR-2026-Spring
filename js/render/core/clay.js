@@ -334,7 +334,7 @@ export function Clay(gl, canvas) {
    }
 
    this.text = (text, info) => {
-      let font = info === undefined || info < 3 ? info : 2;
+      let font = info === undefined || info < 3 ? 2 : info;
       let linesPerPage = info !== undefined && info >= 10 ? info : 100;
 
       const inch = 0.0254;
@@ -348,8 +348,8 @@ export function Clay(gl, canvas) {
          switch (font) {
 	 case 2:
             i = ch % 12; j = ch / 12 >> 0;
-            u0 = (i+1.1/3.3) / 12; v0 = (j+.29) / 8;
-            u1 = (i+2.2/3.3) / 12; v1 = (j+.71) / 8;
+            u0 = .005 + (i+1.1/3.3) / 12.05; v0 = (j+.29) / 8.04;
+            u1 = .005 + (i+2.2/3.3) / 12.05; v1 = (j+.71) / 8.04;
 	    break;
 	 case true:
 	 case 1:
@@ -394,10 +394,12 @@ export function Clay(gl, canvas) {
       let mesh = new Float32Array(V.flat());
       mesh.isTriangles = true;
       mesh.font = font;
-      let typeName = 'udfText' + (1000 * Math.random() >> 0);
+      let typeName = 'udfText' + udfTextIndex++;
       this.defineMesh(typeName, mesh);
       return typeName;
    }
+
+let udfTextIndex = 0;
 
 let M = new cg.Matrix();
 
@@ -537,7 +539,7 @@ let prevTextureResource  = null;
 let prevTextureBindPoint = -1;
 
 let drawMesh = (mesh, materialId, textureSrc, txtr, bumpTextureSrc, bumptxtr, dull, flags, customShader, opacity, view) => {
-   if (!this.renderingIsActive)
+   if (!this.renderingIsActive || opacity < .01)
       return;
 
    let saveProgram = this.clayPgm.program;
