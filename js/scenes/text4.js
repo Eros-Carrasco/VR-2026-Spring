@@ -2,7 +2,8 @@ import { texts } from "../util/texts.js";
 import { readFile, writeFile } from "../file.js";
 
 export const init = async model => {
-   let color = [.25,.375,.5];
+   //let color = [.25,.375,.5];
+   let color = [1,1,1];
    readFile('../media/text/sample1.txt', text => {
       let myText = clay.text(text);
       model.add(myText).move(-.40,2,0).color(color).scale(1/3);

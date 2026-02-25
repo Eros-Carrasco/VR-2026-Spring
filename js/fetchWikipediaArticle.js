@@ -32,3 +32,74 @@ export async function fetchWikipediaFullArticle(title, callback) {
       callback(extract);
    } catch (error) { callback(null); }
 }
+
+export let parseArticle = (text, name) => {
+   let removeLeadingBlankLines = text => {
+      while (text.charAt(0) == '\n')
+         text = text.substring(1);
+      return text;
+   }
+
+   let flatArray = [];                           // FIRST CONVERT TEXT INTO A FLAT ARRAY OF NODES.
+   let lines = text.replace(/–/g,'-')
+                   .replace(/’/g,"'").split('\n');
+   for (let n = 0 ; n < lines.length ; n++) {
+      let line = lines[n];
+      if (line.indexOf('==') == 0) {
+         let level = line.indexOf('======') == 0 ? 5 :
+                     line.indexOf('=====' ) == 0 ? 4 :
+                     line.indexOf('===='  ) == 0 ? 3 :
+                     line.indexOf('==='   ) == 0 ? 2 :
+                                                   1 ;
+         line = line.substring(0,line.length - level-2).substring(level+2,line.length);
+         flatArray.push( { section: line, level: level });
+      }
+      else {
+         let node = flatArray[flatArray.length-1];
+         if (! node || node.data === undefined)
+            flatArray.push(node = { data: '' });
+         node.data += '\n' + line;
+      }
+   }
+
+   let array = [], level = 1;                    // THEN CONVERT THE FLAT ARRAY TO NESTED ARRAYS OF NODES.
+   for (let n = 0 ; n < flatArray.length ; n++)
+      if (flatArray[n].section) {
+         while (flatArray[n].level > level) {
+            let parent = array;
+            parent.push(array = []);
+            array.parent = parent;
+            level++;
+         }
+         while (flatArray[n].level < level) {
+            let parent = array.parent;
+            delete array.parent;
+            array = parent;
+            level--;
+         }
+         array.push(flatArray[n].section);
+      }
+      else
+         array.push(flatArray[n].data)
+
+   let rootnode = { text: array[0] };            // THEN CONVERT THE NESTED ARRAYS TO A NODE HIERARCHY.
+   let parseArray = (array, n, rootnode) => {
+      while (n < array.length) {
+         let node = { };
+         if (! rootnode.sections)
+            rootnode.sections = [];
+         rootnode.sections.push(node);
+         node.name = array[n++];
+         node.text = removeLeadingBlankLines(array[n++]);
+         if (Array.isArray(array[n]))
+            parseArray(array[n++], 0, node);
+      }
+   }
+   parseArray(array, 1, rootnode);
+
+   if (name)
+      rootnode.name = name.replace(/_/g, ' ');
+
+   return rootnode;                              // RETURN THE NODE HIERARCHY.
+}
+
