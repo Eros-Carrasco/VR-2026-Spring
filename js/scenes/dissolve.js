@@ -1,6 +1,5 @@
 import * as cg from "../render/core/cg.js";
 import { texts } from "../util/texts.js";
-import { fetchWikipediaFullArticle } from "../fetchWikipediaArticle.js";
 
 let ramp = (lo,hi,t) => Math.max(.001, Math.min(.999, (t-lo) / (hi-lo)));
 let title = 'Stopping\nby Woods\non a\nSnowy\nEvening';

@@ -26,6 +26,7 @@ export default () => {
          { name: "dissolve"     , path: "./dissolve.js"     , public: true },
          { name: "master1"      , path: "./master1.js"      , public: true },
          { name: "bouncing"     , path: "./bouncing.js"     , public: true },
+         { name: "parse1"       , path: "./parse1.js"       , public: true },
       ]
    };
 }
