@@ -500,7 +500,7 @@ export let mHitRect = (beamMatrix, objMatrix) => {
       return null;			//    then give up.
    let F = i => z * L[i][2] + L[i][3];  // x or y as a function of z.
    for (let i = 1 ; i < L.length ; i++)
-      if (F(i) < 0)			// if outside of any bounding plane
+      if (isNaN(F(i)) || F(i) < 0)	// if outside of any bounding plane
          return null;			//    then give up.
    return [F(1)-1, F(3)-1, -z];		// return [-1...1, -1...1, z-dist]
 }

@@ -74,7 +74,6 @@ export function Clay(gl, canvas) {
          this.vao = gl.createVertexArray();
       };
    }
-   //this.controllerOrigin = hand => cg.mTransform(controllerMatrix[hand], [hand=='left'?.01:-.01,-.04,-.08]);
    this.controllerOrigin = hand => cg.mTransform(controllerMatrix[hand], [0,-.05,-.08]);
    this.gl = gl;
    this.clayPgm = new clayPgm();
@@ -101,6 +100,17 @@ export function Clay(gl, canvas) {
    }
    
    this.defineMesh = (name, value) => formMesh[name] = convertToMesh(value);
+
+   this.meshBounds = form => {
+      let mesh = this.getMesh(form);
+      let lo = [1000, 1000, 1000], hi = [-1000, -1000, -1000];
+      for (let n = 0 ; n < mesh.length ; n += 16)
+         for (let i = 0 ; i < 3 ; i++) {
+            lo[i] = Math.min(lo[i], mesh[n+i]);
+            hi[i] = Math.max(hi[i], mesh[n+i]);
+         }
+      return { lo: lo, hi: hi };
+   }
 
    this.setDataMeshText = (form, id, text, col = 0) => {
       let mesh = this.getMesh(form), data = mesh.textData;
