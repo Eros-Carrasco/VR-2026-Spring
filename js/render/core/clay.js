@@ -343,6 +343,17 @@ export function Clay(gl, canvas) {
       this.defineMesh(name, mesh);
    }
 
+   this.textLine = (obj, row) => {
+      let data = this.getMesh(obj.getForm()).data, text = '', n = 0;
+      for ( ; n < data.length ; n++)
+         if (data[n][1] == row) {
+	    while (data[n] && data[n][1] == row)
+	       text += String.fromCharCode(data[n++][2]);
+            break;
+         }
+      return text;
+   }
+
    this.text = (text, info) => {
       let font = info === undefined || info < 3 ? 2 : info;
       let linesPerPage = info !== undefined && info >= 10 ? info : 100;
@@ -358,8 +369,8 @@ export function Clay(gl, canvas) {
          switch (font) {
 	 case 2:
             i = ch % 12; j = ch / 12 >> 0;
-            u0 = .005 + (i+1.1/3.3) / 12.05; v0 = (j+.29) / 8.04;
-            u1 = .005 + (i+2.2/3.3) / 12.05; v1 = (j+.71) / 8.04;
+            u0 = .005 + (i+1/3) / 12.05; v0 = (j+.29) / 8.04;
+            u1 = .005 + (i+2/3) / 12.05; v1 = (j+.71) / 8.04;
 	    break;
 	 case true:
 	 case 1:
@@ -382,6 +393,8 @@ export function Clay(gl, canvas) {
          add(0,0); add(1,1); add(1,0);
       }
 
+      let data = [], line = 0;
+
       let V = [], col = 0, row = 0, minCol = 0, colsPerPage = 0;
       for (let n = 0 ; n < text.length ; n++) {
          let charCode = text.charCodeAt(n);
@@ -394,7 +407,8 @@ export function Clay(gl, canvas) {
 		     minCol = col += colsPerPage;
 		  }
 	          break;
-         default: charQuad(col++, row, charCode - 32);
+         default: data.push([col,row,charCode]);
+	          charQuad(col++, row, charCode - 32);
 	          if (minCol == 0)
 	             colsPerPage = Math.max(colsPerPage, col);
 	          break;
@@ -404,6 +418,7 @@ export function Clay(gl, canvas) {
       let mesh = new Float32Array(V.flat());
       mesh.isTriangles = true;
       mesh.font = font;
+      mesh.data = data;
       let typeName = 'udfText' + udfTextIndex++;
       this.defineMesh(typeName, mesh);
       return typeName;

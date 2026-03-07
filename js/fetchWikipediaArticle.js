@@ -34,12 +34,6 @@ export async function fetchWikipediaFullArticle(title, callback) {
 }
 
 export let parseArticle = (text, name) => {
-   let removeLeadingBlankLines = text => {
-      while (text.charAt(0) == '\n')
-         text = text.substring(1);
-      return text;
-   }
-
    let flatArray = [];                           // FIRST CONVERT TEXT INTO A FLAT ARRAY OF NODES.
    let lines = text.replace(/–/g,'-')
                    .replace(/’/g,"'").split('\n');
@@ -90,7 +84,7 @@ export let parseArticle = (text, name) => {
             rootnode.sections = [];
          rootnode.sections.push(node);
          node.name = array[n++];
-         node.text = removeLeadingBlankLines(array[n++]);
+         node.text = array[n++].trim();
          if (Array.isArray(array[n]))
             parseArray(array[n++], 0, node);
       }

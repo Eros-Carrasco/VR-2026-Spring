@@ -2,12 +2,15 @@ import * as cg from "../render/core/cg.js";
 import { ControllerBeam } from "../render/core/controllerInput.js";
 import { fetchWikipediaFullArticle, parseArticle } from "../fetchWikipediaArticle.js";
 
-// INTERACTIVELY EXPLORE A WIKIPEDIA PAGE WITH CONTROLLERS OR WITH HANDS
+// INTERACTIVELY EXPLORE WIKIPEDIA ARTICLES WITH CONTROLLERS OR WITH HANDS
 
 export const init = async model => {
    const inch = .0254, cw = .01271;
    const linesPerPage = 68;
    const x0 = -.2, y0 = 1.5;
+
+   let selectedText = null, isStartingTextSelection, isDraggingText;
+   let textSelectionStart = -1, textSelectionEnd = -1;
 
    let modelPos = [0,0,0], modelScale = .8;
 
@@ -30,31 +33,35 @@ export const init = async model => {
    inputEvents.onPress = hand => {
       isPressed[hand] = true;
       handPos[hand] = inputEvents.pos(hand);
+
+      // PINCH AND HOLD WITH LEFT HAND OR RIGHT CONTROLLER TO SELECT LONGER TEXT
+
+      if (nSelect >= 0 && (hand == 'left'  &&   window.handtracking ||
+                           hand == 'right' && ! window.handtracking))
+         isStartingTextSelection = true;
    }
 
    inputEvents.onDrag = hand => {
-      if (window.handtracking) {
-         if (isPressed.left && isPressed.right) {
-	    let a = cg.norm(cg.subtract(handPos.left, handPos.right));
-            handPos[hand] = inputEvents.pos(hand);
-	    let b = cg.norm(cg.subtract(handPos.left, handPos.right));
-	    modelScale = Math.max(.2, Math.min(.8, modelScale * b / a));
-	    if (modelScale > .2 && modelScale < .8)
-	       modelPos[1] = (modelPos[1] - y0) * (1 + b / a) / 2 + y0;
-	 }
-         else if (hand == 'right')
-            modelPos = cg.add(modelPos, cg.subtract(inputEvents.pos(hand), handPos[hand]));
-         handPos[hand] = inputEvents.pos(hand);
-      }
+      if (hand == 'right' && window.handtracking)
+         modelPos = cg.add(modelPos, cg.subtract(inputEvents.pos(hand), handPos[hand]));
+      handPos[hand] = inputEvents.pos(hand);
    }
 
    inputEvents.onRelease = hand => {
       isPressed[hand] = false;
-      if (! window.handtracking)
+      if (hand == 'left' && ! window.handtracking)
          isLocked = ! isLocked;
+      if (hand == 'right' && ! window.handtracking || hand == 'left' && window.handtracking)
+         console.log(selectedText);
+
+      if (hand == 'left'  &&   window.handtracking ||
+          hand == 'right' && ! window.handtracking) {
+         isDraggingText = false;
+	 textSelectionStart = textSelectionEnd = -1;
+      }
    }
 
-   // ADD A SECTION TO THE VISUALIZATION OF THE WIKIPEDIA PAGE
+   // ADD A SECTION TO THE VISUALIZATION OF THE WIKIPEDIA ARTICLE
 
    let addNode = (node, x, level) => {
 
@@ -82,7 +89,7 @@ export const init = async model => {
 	 let textForm = clay.text(text, linesPerPage);
          let { lo, hi } = clay.meshBounds(textForm);
 	 section.add('square').move ((lo[0]+hi[0])/2-.008,
-	                             (lo[1]+hi[1])/2-.008, 0)
+	                             (lo[1]+hi[1])/2-.000, 0)
 			      .scale((hi[0]-lo[0])/2+.016,
 			             (hi[1]-lo[1])/2+.016, 1).opacity(.001);
 	 section.add(textForm).color(0,0,0).move(0,0,.0001).opacity(.001);
@@ -205,6 +212,7 @@ export const init = async model => {
          }
 	 if (isHitNoText)
 	    isAnyHit = false;
+
          for (let n = 0 ; n < model.nChildren() ; n++)
 	    if (model.child(n).child(1))
 	       model.child(n).child(1).opacity(isAnyHit && n > nSelect ? .25 : 1);
@@ -213,6 +221,7 @@ export const init = async model => {
       // WHEN A SECTION IS SELECTED, AND IF THERE IS ANY TEXT IN THAT SECTION,
       // HIGHLIGHT WHERE THE RIGHT CONTROLLER BEAM FOR FINGER IS POINTING IN THE TEXT.
 
+      selectedText = null;
       if (nSelect >= 0) {
          let obj = model.child(nSelect);
 	 if (obj.child(2)) {
@@ -220,9 +229,17 @@ export const init = async model => {
 
 	    let isHit = false;
 
+	    // RETRIEVE THE VISIBLE BOUNDS OF THE TEXT BLOCK
+
 	    let text = section.child(1);
 	    let m = text.getGlobalMatrix();
 	    let { lo, hi } = clay.meshBounds(text.getForm());
+	    lo[0] -= .008;
+	    lo[1] -= .016;
+	    hi[0] += .008;
+	    hi[1] += .008;
+
+	    // FIND WHETHER / WHERE THE USER IS POINTING WITHIN THE TEXT BLOCk
 
             let p;
             if (window.handtracking) {
@@ -240,14 +257,60 @@ export const init = async model => {
 
 	    section.color(isHit ? [1,.5,.5] : [1,1,1]);
 
+	    highlight.scale(0);
             if (isHit) {
-	       let col = (p[0] - lo[0]) / cw >> 0;
-	       let row = (hi[1] - p[1]) / inch >> 0;
-	       let m = title.getMatrix();
-	       highlight.setMatrix(m)
-                        .scale(cw/12,inch/12,1)
-	                .move((col*.4 + 8.95) * 4, -(row*.4 + nSelect + 1.1) * 4, .0001)
-	                .move(1,-1,0);
+
+	       // FIND THE COLUMN AND ROW WITHIN THE TEXT WHERE THE USER IS POINTING
+
+	       let col = Math.max(0,  p[0]) / cw   >> 0;
+	       let row = Math.max(0, -p[1]) / inch >> 0;
+	       row = Math.min(row, -lo[1] / inch >> 0);
+
+	       // IF THERE IS A LINE OF TEXT HERE, THEN
+
+               let line = clay.textLine(text, row);
+	       if (line.length <= col)
+	          highlight.scale(0);
+               else {
+
+	          if (isStartingTextSelection) {
+		     textSelectionStart = col;
+		     isStartingTextSelection = false;
+		     isDraggingText = true;
+		  }
+
+	          if (isDraggingText)
+		     textSelectionEnd = col;
+
+	          let c0 = col, c1 = col;
+
+	          // DRAG SELECTION
+
+                  if (textSelectionStart >= 0 && textSelectionEnd >= 0) {
+		     c0 = Math.min(textSelectionStart, textSelectionEnd);
+		     c1 = Math.max(textSelectionStart, textSelectionEnd) + 1;
+		  }
+
+	          // FIND THE BEGINNING AND END OF THE WORD(S) THE USER IS POINTING AT
+
+                  let inWord = c => /^[-a-z0-9]$/i.test(line.charAt(c));
+   	          while (c0 > 0           && inWord(c0-1)) c0--;
+		  while (c1 < line.length && inWord(c1  )) c1++;
+
+		  // SAVE THE SELECTED WORD
+
+		  selectedText = line.substring(c0, c1);
+
+		  // VISUALLY HIGHLIGHT THAT WORD
+
+	          let m = title.getMatrix();
+	          highlight.setMatrix(m)
+                           .scale(cw/12,inch/12,1)
+	                   .move((c0*.4 + 8.95) * 4, -(row*.4 + nSelect + 1.1) * 4, .0001)
+			   .scale(.8,1,1)
+			   .scale(c1-c0,1,1)
+	                   .move(1,-1,0);
+	       }
 	    }
 	 }
       }

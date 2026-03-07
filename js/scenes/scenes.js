@@ -27,6 +27,7 @@ export default () => {
          { name: "master1"      , path: "./master1.js"      , public: true },
          { name: "bouncing"     , path: "./bouncing.js"     , public: true },
          { name: "parse1"       , path: "./parse1.js"       , public: true },
+
          { name: "beam"         , path: "./beam.js"         , public: true },
          { name: "headGaze"     , path: "./headGaze.js"     , public: true },
          { name: "reading"      , path: "./reading.js"      , public: true },
