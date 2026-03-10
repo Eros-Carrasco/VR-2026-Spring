@@ -112,7 +112,16 @@ export function ControllerBeam(model, hand) {
                    window.handtracking ? this.m :
                                          cg.mMultiply(this.m, cg.mMultiply(cg.mRotateX(-bend),
 			                                                   cg.mTranslate([0,.02,0]))));
-   this.hitRect = m => this.isEnabled ? cg.mHitRect(this.beamMatrix(), m) : null;
+   this.hitRect = (m, flag) => this.isEnabled ? cg.mHitRect(this.beamMatrix(), m, flag) : null;
+   this.hitPoint = (m, flag) =>  {
+      let uvd = this.hitRect(m, flag);
+      if (! uvd)
+         return null;
+      let bm = this.beamMatrix();
+      let V = bm.slice(12,15);
+      let W = bm.slice(8,11);
+      return cg.mTransform(cg.mInverse(worldCoords), cg.add(V, cg.scale(W, -uvd[2])));
+   }
    this.projectOntoBeam = P => {
       let bm = this.beamMatrix();	// get controller beam matrix
       let o = bm.slice(12, 15);		// get origin of beam

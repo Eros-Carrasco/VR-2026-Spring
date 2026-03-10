@@ -933,6 +933,12 @@ function updateInputSources(session, frame, refSpace) {
         window.avatars[window.playerid].headset.matrix =
             headPose.transform.matrix;
 
+        window.vibrate = (hand, intensity = 1, duration = 100) => {
+           for (let source of session.inputSources)
+	      if (source.handedness == hand)
+                  source.gamepad.hapticActuators[0].pulse(intensity, duration);
+	}
+
         for (let source of session.inputSources) {
             if (!window.handtracking && source.handedness && source.gamepad) {
                 // if (source.gamepad.buttons[3].pressed) {

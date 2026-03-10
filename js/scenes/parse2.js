@@ -4,35 +4,101 @@ import { fetchWikipediaFullArticle, parseArticle } from "../fetchWikipediaArticl
 
 // INTERACTIVELY EXPLORE WIKIPEDIA ARTICLES WITH CONTROLLERS OR WITH HANDS
 
-export const init = async model => {
+/*
+   To do:
+      DONE Left swipe-left with beam to lock/unlock.
+      DONE Left swipe-left on titleBar to toggle open/close.
+      DONE Drag on titleBar to move article.
+      DONE Right swipe-right on titleBar to delete article.
+
+      Get auto-yaw working when worldCoords is rotated.
+
+      Implement good auto-positioning for new articleNodes.
+
+      There should be no multi-column text blocks:
+
+         Text block should only show first text that fits, and
+         the amount of text to see should change with distance.
+
+	 To try: dynamically create the selected text block.
+
+      Problem with this: What about highlighted text?
+*/
+
+function ArticleNode (model, articleName) {
    const inch = .0254, cw = .01271;
    const linesPerPage = 68;
-   const x0 = -.2, y0 = 1.5;
+   const x0 = -.2, y0 = 2.0;
 
-   let selectedText = null, isStartingTextSelection, isDraggingText;
+   let article, titleBar, highlightBar;
+   let pos = [0,0,0], scale = .8, y = y0;
+   let selectedText = '', isStartingTextSelection, isDraggingText;
    let textSelectionStart = -1, textSelectionEnd = -1;
+   let isInTitleBar = null, isOpen = true, isLocked = false, nSelect = -1;
+   let handPos = {};
 
-   let modelPos = [0,0,0], modelScale = .8;
+   // POSITION OF USER POINTER RELATIVE TO A FOCUS BAR
 
-   let articleName = 'Virtual reality', title, highlight;
-   let y = y0;
+   let relToBar = (hand, n) => {
+      let obj = n < 0 ? titleBar : article.child(n);
+      let focusBar = obj.child(0);
+      let m = cg.mMultiply(cg.mInverse(worldCoords), focusBar.getGlobalMatrix());
+      let p = inputEvents.pos(hand);
+      return p ? cg.mTransform(cg.mInverse(m), [p[0],p[1]+inch/2*scale,p[2]]) : null;
+   }
 
-   // DECLARE THE LEFT AND RIGHT CONTROLLER BEAM INTERFACES
+   // IS USER POINTER INSIDE A FOCUS BAR?
 
-   let beam = {
-      left:  new ControllerBeam(model, 'left'),
-      right: new ControllerBeam(model, 'right')
-   };
+   let isInBar = (hand, n) => {
+      if (window.handtracking) {
+         let p = relToBar(hand, n);
+         return p && Math.max(p[0]*p[0], p[1]*p[1], p[2]*p[2]) < 1;
+      }
+      else {
+         let obj = n < 0 ? titleBar : article.child(n);
+         let focusBar = obj.child(0);
+         return model.beam[hand].hitRect(focusBar.getGlobalMatrix()) != null;
+      }
+   }
 
-   // HANDLE INPUT EVENTS
+   // IS USER POINTER BESIDE A FOCUS BAR?
 
-   let isPressed = { left: false, right: false }, isLocked = false, nSelect = -1;
+   let isBesideBar = (hand, n, side) => {
+      let isBeside = u => side == -1 ? u < -1 : u > 1;
+      if (window.handtracking) {
+         let p = relToBar(hand, n);
+         return isBeside(p[0]) && p[1]*p[1] < 1 && p[2]*p[2] < 1;
+      }
+      else {
+         let obj = n < 0 ? titleBar : article.child(n);
+         let focusBar = obj.child(0);
+         let uvz = model.beam[hand].hitRect(focusBar.getGlobalMatrix(), true);
+	 return uvz && uvz[1] > -1 && uvz[1] < 1 && isBeside(uvz[0]);
+      }
+   }
 
-   let handPos = {left:[0,0,0], right:[0,0,0]};
+   this.hasFocus = () => {
+      for (let n = 0 ; n < article.nChildren() ; n++) {
+         let obj = article.child(n);
+	 let focusBar = obj.child(0);
+         if (! focusBar || obj == highlightBar)
+            continue;
 
-   inputEvents.onPress = hand => {
-      isPressed[hand] = true;
-      handPos[hand] = inputEvents.pos(hand);
+         if (window.handtracking)
+            if (isInBar('left', n) || n == nSelect && isBesideBar('left', n, -1))
+               return true;
+
+         if (! window.handtracking)
+	    if (model.beam.left.hitRect(focusBar.getGlobalMatrix()))
+               return true;
+
+	 if (positionInSelectedText())
+	    return true;
+      }
+      return false;
+   }
+
+   this.onPress = hand => {
 
       // PINCH AND HOLD WITH LEFT HAND OR RIGHT CONTROLLER TO SELECT LONGER TEXT
 
@@ -41,23 +107,36 @@ export const init = async model => {
          isStartingTextSelection = true;
    }
 
-   inputEvents.onDrag = hand => {
-      if (hand == 'right' && window.handtracking)
-         modelPos = cg.add(modelPos, cg.subtract(inputEvents.pos(hand), handPos[hand]));
-      handPos[hand] = inputEvents.pos(hand);
+   this.onDrag = hand => {
+
+      // TO MOVE AN ARTICLE NODE, DRAG ON ITS TITLE BAR.
+
+      for (let hand in {left:0, right:0}) {
+         let p = inputEvents.pos(hand);
+         if (handPos[hand] && isInBar(hand, -1))
+            pos = cg.add(pos, cg.subtract(p, handPos[hand]));
+         handPos[hand] = p;
+      }
    }
 
-   inputEvents.onRelease = hand => {
-      isPressed[hand] = false;
+   this.onRelease = hand => {
+      delete handPos[hand];
+
       if (hand == 'left' && ! window.handtracking)
          isLocked = ! isLocked;
-      if (hand == 'right' && ! window.handtracking || hand == 'left' && window.handtracking)
-         console.log(selectedText);
+
+      if (hand == 'right' && ! window.handtracking || hand == 'left' && window.handtracking) {
+         if (selectedText.length > 0) {
+            let articleNode = new ArticleNode(model, selectedText);
+	    articleNodes.push(articleNode);
+	    articleNode.setPos([x0 + .2 * articleNodes.length, 0, 0]);
+         }
+      }
 
       if (hand == 'left'  &&   window.handtracking ||
           hand == 'right' && ! window.handtracking) {
          isDraggingText = false;
-	 textSelectionStart = textSelectionEnd = -1;
+         textSelectionStart = textSelectionEnd = -1;
       }
    }
 
@@ -65,34 +144,37 @@ export const init = async model => {
 
    let addNode = (node, x, level) => {
 
-      let obj = model.add();
+      let obj = article.add();
+      let focusBar  = obj.add();
+      let nameBar   = obj.add();
+      let textBlock = obj.add();
 
-      // ADD THE INTERACTION HANDLE TO THE LEFT OF THE SECTION NAME LABEL
+      // ADD THE FOCUS BAR TO THE LEFT OF THE NAME BAR
 
-      obj.add().move(x0 + (x-x0)/2, y -= inch, 0).scale((x-x0)/2,inch/2,2*inch)
-               .add('square').scale(1,1/1.1,1).dull().opacity(.75);
+      focusBar.move(x0 + (x-x0)/2, y -= inch, 0).scale((x-x0)/2,inch/2,2*inch)
+              .add('square').scale(1,1/1.1,1).dull().opacity(.75);
 
-      // ADD THE SECTION NAME LABEL
+      // ADD THE NAME BAR
 
-      let label = obj.add().move(x, y+inch/2, 0);
+      nameBar.move(x, y+inch/2, 0);
       if (node.name) {
          let nc = node.name.length;
-         label.add('square').move(nc*cw/2, -inch/2, 0).scale(nc*cw/2, inch/2.2, 1).opacity(.6);
-         label.add(clay.text(node.name)).move(0,0,.0001).color(0,0,0);
+         nameBar.add('square').move(nc*cw/2, -inch/2, 0).scale(nc*cw/2, inch/2.2, 1).opacity(.6);
+         nameBar.add(clay.text(node.name)).move(0,0,.0001).color(0,0,0);
       }
 
-      // ADD THE SECTION TEXT, IF ANY
+      // ADD THE TEXT BLOCK, IF ANY
 
       let text = cg.split(node.text, 75);
       if (text.length) {
-         let section = obj.add().move(x0+9*cw,y-inch*2/3,.0002).scale(.4);
-	 let textForm = clay.text(text, linesPerPage);
+         textBlock.move(x0+9*cw,y-inch*2/3,.0002).scale(.4);
+         let textForm = clay.text(text, linesPerPage);
          let { lo, hi } = clay.meshBounds(textForm);
-	 section.add('square').move ((lo[0]+hi[0])/2-.008,
-	                             (lo[1]+hi[1])/2-.000, 0)
-			      .scale((hi[0]-lo[0])/2+.016,
-			             (hi[1]-lo[1])/2+.016, 1).opacity(.001);
-	 section.add(textForm).color(0,0,0).move(0,0,.0001).opacity(.001);
+         textBlock.add('square').move ((lo[0]+hi[0])/2-.008,
+                                       (lo[1]+hi[1])/2-.000, 0)
+                                .scale((hi[0]-lo[0])/2+.016,
+                                       (hi[1]-lo[1])/2+.016, 1).opacity(.001);
+         textBlock.add(textForm).color(0,0,0).move(0,0,.0001).opacity(.001);
       }
 
       // DO THIS RECURSIVELY THROUGH SUBSECTIONS
@@ -104,73 +186,107 @@ export const init = async model => {
 
    // FETCH AND PARSE THE WIKIPEDIA ARTICLE, AND DECLARE THE TITLE AND CURSOR HIGHLIGHT OBJECTS
 
+   article = model.add();
+
+   this.article = article;
+
    fetchWikipediaFullArticle(articleName, text => {
       if (text) {
          let node = parseArticle(text);
          addNode(node, x0, 0);
 
-         title = model.add().move(x0,y0+1.5*inch,0).scale(3);
-	 let nc = articleName.length;
-	 title.add('square').move(nc*cw/2,-inch/2,.001).scale(nc*cw/2,inch/2,1).opacity(.8);
-	 title.add(clay.text(articleName)).move(0,0,.002).color(0,0,0);
+         titleBar = article.add().move(x0,y0+1.5*inch,0).scale(3);
+         let nc = articleName.length;
+         titleBar.add('square').move(nc*cw/2,-inch/2,.001).scale(nc*cw/2,inch/2,1).opacity(.8);
+         titleBar.add(clay.text(articleName)).move(0,0,.002).color(0,0,0);
 
-	 highlight = model.add('square').opacity(.7).scale(0);
+         highlightBar = article.add('square').opacity(.7).scale(0);
       }
    });
 
-   model.animate(() => {
+   let positionInSelectedText = () => {
 
-      model.identity().move(modelPos).scale(modelScale);
+      // IF NO SELECTION OR SELECTION HAS NO TEXT, RETURN FALSE
 
-      beam.left.update();
-      beam.right.update();
+      if (nSelect < 0)
+         return null;
+      let obj = article.child(nSelect);
+      let section = obj.child(2);
+      if (! section)
+         return null;
 
-      // POSITION OF MY FINGER RELATIVE TO AN INTERACTION BAR
+      // RETRIEVE THE VISIBLE BOUNDS OF THE TEXT BLOCK
 
-      let fingerRelToBar = (hand, n) => {
-         let obj = model.child(n);
-	 let m = obj.child(0).getGlobalMatrix();
-         m = cg.mMultiply(cg.mInverse(worldCoords), m);
-         let p = inputEvents.pos(hand);
-	 return p ? cg.mTransform(cg.mInverse(m), [p[0],p[1]+inch/2*modelScale,p[2]]) : null;
+      let text = section.child(1);
+      let m = text.getGlobalMatrix();
+      let { lo, hi } = clay.meshBounds(text.getForm());
+      lo[0] -= .008;
+      lo[1] -= .016;
+      hi[0] += .008;
+      hi[1] += .008;
+
+      // FIND WHETHER / WHERE THE USER IS POINTING WITHIN THE TEXT BLOCK
+
+      let p;
+      if (window.handtracking) {
+         let im = cg.mMultiply(cg.mInverse(m), worldCoords);
+         p = cg.mTransform(im, inputEvents.pos('right'));
+         if (! (p[0] > lo[0] && p[0] < hi[0] &&
+                p[1] > lo[1] && p[1] < hi[1] &&
+                p[2] > 0 && p[2] < 8*inch) )
+            return null;
+      }
+      else {
+         p = model.beam.right.hitRect(m, true);
+         if (! (p && p[0] > lo[0] && p[0] < hi[0]
+                  && p[1] > lo[1] && p[1] < hi[1]) )
+            return null;
       }
 
-      // IS MY FINGER IN AN INTERACTION BAR?
+      let col = Math.max(0,  p[0]) / cw   >> 0;
+      let row = Math.max(0, -p[1]) / inch >> 0;
+      row = Math.min(row, -lo[1] / inch >> 0);
 
-      let isFingerInBar = (hand, n) => {
-	 let p = fingerRelToBar(hand, n);
-	 return p && Math.max(p[0]*p[0], p[1]*p[1], p[2]*p[2]) < 1;
-      }
+      return { col: col, row: row };
+   }
 
-      // IS MY FINGER TO THE LEFT OF AN INTERACTION BAR?
+   this.setPos = p => pos = p;
 
-      let isFingerLeftOfBar = (hand, n) => {
-	 let p = fingerRelToBar(hand, n);
-	 return p[0] < -1 && p[1]*p[1] < 1 && p[2]*p[2] < 1;
-      }
+   this.update = () => {
+
+      // NEED TO FIX: DOES NOT WORK WHEN worldCoords HAS ROTATION
+
+      let wc = worldCoords;
+      let m = cg.mInverse(clay.root().viewMatrix(0));
+      let p = cg.mTransform(wc, pos);
+      let theta = Math.atan2(m[12]-p[0], m[14]-p[2]) - Math.atan2(wc[8], wc[10]);
+
+      article.identity().move(pos).turnY(theta).scale(scale);
 
       let isAnyHit = false;
 
       // LEFT HAND INTERACTION AND DISPLAY LOGIC WHEN SOME SELECTION IS LOCKED
 
       if (isLocked) {
-         for (let n = 0 ; n < model.nChildren() ; n++) {
+         for (let n = 0 ; n < article.nChildren() ; n++) {
 
-            if (window.handtracking && n == nSelect)
-	       for (let hand in {left:0,right:0})
-	          if (isFingerInBar(hand, n))
-	             isLocked = false;
+            if (isInBar('left', n))
+               isLocked = false;
 
-            let obj = model.child(n);
-	    if (! obj.child(0) || obj == title || obj == highlight)
-	       continue;
+            let obj = article.child(n);
+	    let focusBar  = obj.child(0);
+	    let nameBar   = obj.child(1);
+	    let textBlock = obj.child(2);
 
-	    obj.child(0).color(n == nSelect ? [0,0,0] : [1,1,1]);
-	    if (obj.child(1))
-	       obj.child(1).opacity(n > nSelect ? .25 : 1);
-	    if (obj.child(2)) {
-	       obj.child(2).child(0).opacity(n == nSelect ? 0.8 : .001);
-	       obj.child(2).child(1).opacity(n == nSelect ? 1.0 : .001);
+            if (! focusBar || obj == titleBar || obj == highlightBar)
+               continue;
+
+            focusBar.color(n == nSelect ? [0,0,0] : [1,1,1]);
+            if (nameBar)
+               nameBar.opacity(! isOpen ? .001 : n > nSelect ? .25 : 1);
+            if (textBlock && textBlock.child(0)) {
+               textBlock.child(0).opacity(! isOpen ? .001 : n == nSelect ? 0.8 : .001);
+               textBlock.child(1).opacity(! isOpen ? .001 : n == nSelect ? 1.0 : .001);
             }
          }
       }
@@ -179,143 +295,177 @@ export const init = async model => {
 
       else {
          let isHitNoText = false;
-         for (let n = 0 ; n < model.nChildren() ; n++) {
-            let obj = model.child(n);
-	    if (! obj.child(0) || obj == title || obj == highlight)
-	       continue;
+         for (let n = 0 ; n < article.nChildren() ; n++) {
 
-	    let isText = obj.child(2);
-	    let isHit = false;
+            let obj = article.child(n);
+	    let focusBar  = obj.child(0);
+	    let nameBar   = obj.child(1);
+	    let textBlock = obj.child(2);
 
-	    let m = obj.child(0).getGlobalMatrix();
+            if (! focusBar || obj == titleBar || obj == highlightBar)
+               continue;
 
-	    for (let hand in {left:0,right:0})
-	       if (window.handtracking) {
-	          if (isFingerInBar(hand, n))
-		     isHit = true;
-	          if (n == nSelect && isFingerLeftOfBar(hand, n))
-	             isLocked = isHit = true;
-	       }
-	       else if (beam[hand].hitRect(m))
-		  isHit = true;
+            let isText = obj.child(2);
+            let isHit = false;
 
-	    if (isHit && isText)
-	       nSelect = n;
-	    if (isHit && ! isText)
-	       isHitNoText = true;
-	    obj.child(0).color(isHit ? isText ? [0,.5,1] : [1,.25,.25] : [1,1,1]);
-	    if (isText) {
-               obj.child(2).child(0).opacity(isHit ? 0.8 : .001);
-               obj.child(2).child(1).opacity(isHit ? 1.0 : .001);
+            let m = focusBar.getGlobalMatrix();
+
+            if (isInBar('left', n))
+               isHit = true;
+            if (n == nSelect && isBesideBar('left', n, -1))
+               isLocked = isHit = true;
+
+            if (isHit && textBlock)
+               nSelect = n;
+            if (isHit && ! textBlock)
+               isHitNoText = true;
+
+            focusBar.child(0).opacity(! isOpen ? .001 : .75);
+            focusBar.color(isHit ? textBlock ? [0,.5,1] : [1,.25,.25] : [1,1,1]);
+
+            if (nameBar.child(0))
+               nameBar.child(0).opacity(! isOpen ? .001 : .6);
+
+            if (textBlock && textBlock.child(0)) {
+               textBlock.child(0).opacity(! isOpen ? .001 : isHit ? 0.8 : .001);
+               textBlock.child(1).opacity(! isOpen ? .001 : isHit ? 1.0 : .001);
             }
             isAnyHit |= isHit;
          }
-	 if (isHitNoText)
-	    isAnyHit = false;
+         if (isHitNoText)
+            isAnyHit = false;
 
-         for (let n = 0 ; n < model.nChildren() ; n++)
-	    if (model.child(n).child(1))
-	       model.child(n).child(1).opacity(isAnyHit && n > nSelect ? .25 : 1);
+         for (let n = 0 ; n < article.nChildren() ; n++)
+            if (article.child(n).child(1))
+               article.child(n).child(1).opacity(! isOpen ? .001 : isAnyHit && n > nSelect ? .25 : 1);
       }
 
       // WHEN A SECTION IS SELECTED, AND IF THERE IS ANY TEXT IN THAT SECTION,
       // HIGHLIGHT WHERE THE RIGHT CONTROLLER BEAM FOR FINGER IS POINTING IN THE TEXT.
 
-      selectedText = null;
+      selectedText = '';
       if (nSelect >= 0) {
-         let obj = model.child(nSelect);
-	 if (obj.child(2)) {
-	    let section = obj.child(2);
+         let obj = article.child(nSelect);
 
-	    let isHit = false;
+         let textBlock = obj.child(2);
+         if (textBlock) {
 
-	    // RETRIEVE THE VISIBLE BOUNDS OF THE TEXT BLOCK
+            let position = positionInSelectedText();
+            textBlock.color(position ? [1,.5,.5] : [1,1,1]);
 
-	    let text = section.child(1);
-	    let m = text.getGlobalMatrix();
-	    let { lo, hi } = clay.meshBounds(text.getForm());
-	    lo[0] -= .008;
-	    lo[1] -= .016;
-	    hi[0] += .008;
-	    hi[1] += .008;
+	    if (position) {
 
-	    // FIND WHETHER / WHERE THE USER IS POINTING WITHIN THE TEXT BLOCk
+               let { col, row } = position;
 
-            let p;
-            if (window.handtracking) {
-	       let im = cg.mMultiply(cg.mInverse(m), worldCoords);
-	       p = cg.mTransform(im, inputEvents.pos('right'));
-	       isHit = p[0] > lo[0] && p[0] < hi[0] &&
-	               p[1] > lo[1] && p[1] < hi[1] &&
-		       p[2] > 0 && p[2] < 8*inch;
-	    }
-	    else {
-               p = beam.right.hitRect(m);
-	       isHit = p && p[0] > lo[0] && p[0] < hi[0] &&
-	                    p[1] > lo[1] && p[1] < hi[1] ;
-	    }
+               // IF THERE IS A LINE OF TEXT HERE, THEN
 
-	    section.color(isHit ? [1,.5,.5] : [1,1,1]);
-
-	    highlight.scale(0);
-            if (isHit) {
-
-	       // FIND THE COLUMN AND ROW WITHIN THE TEXT WHERE THE USER IS POINTING
-
-	       let col = Math.max(0,  p[0]) / cw   >> 0;
-	       let row = Math.max(0, -p[1]) / inch >> 0;
-	       row = Math.min(row, -lo[1] / inch >> 0);
-
-	       // IF THERE IS A LINE OF TEXT HERE, THEN
-
+               let text = textBlock.child(1);
                let line = clay.textLine(text, row);
-	       if (line.length <= col)
-	          highlight.scale(0);
+               if (line.length <= col)
+                  highlightBar.scale(0);
                else {
 
-	          if (isStartingTextSelection) {
-		     textSelectionStart = col;
-		     isStartingTextSelection = false;
-		     isDraggingText = true;
-		  }
+                  if (isStartingTextSelection) {
+                     textSelectionStart = col;
+                     isStartingTextSelection = false;
+                     isDraggingText = true;
+                  }
 
-	          if (isDraggingText)
-		     textSelectionEnd = col;
+                  if (isDraggingText)
+                     textSelectionEnd = col;
 
-	          let c0 = col, c1 = col;
+                  let c0 = col, c1 = col;
 
-	          // DRAG SELECTION
+                  // DRAG SELECTION
 
                   if (textSelectionStart >= 0 && textSelectionEnd >= 0) {
-		     c0 = Math.min(textSelectionStart, textSelectionEnd);
-		     c1 = Math.max(textSelectionStart, textSelectionEnd) + 1;
-		  }
+                     c0 = Math.min(textSelectionStart, textSelectionEnd);
+                     c1 = Math.max(textSelectionStart, textSelectionEnd) + 1;
+                  }
 
-	          // FIND THE BEGINNING AND END OF THE WORD(S) THE USER IS POINTING AT
+                  // FIND THE BEGINNING AND END OF THE WORD(S) THE USER IS POINTING AT
 
                   let inWord = c => /^[-a-z0-9]$/i.test(line.charAt(c));
-   	          while (c0 > 0           && inWord(c0-1)) c0--;
-		  while (c1 < line.length && inWord(c1  )) c1++;
+                     while (c0 > 0           && inWord(c0-1)) c0--;
+                  while (c1 < line.length && inWord(c1  )) c1++;
 
-		  // SAVE THE SELECTED WORD
+                  // REMEMBER THE SELECTED WORD
 
-		  selectedText = line.substring(c0, c1);
+                  selectedText = line.substring(c0, c1);
 
-		  // VISUALLY HIGHLIGHT THAT WORD
+                  // VISUALLY HIGHLIGHT THAT WORD
 
-	          let m = title.getMatrix();
-	          highlight.setMatrix(m)
+                  let m = titleBar.getMatrix();
+                  highlightBar.setMatrix(m)
                            .scale(cw/12,inch/12,1)
-	                   .move((c0*.4 + 8.95) * 4, -(row*.4 + nSelect + 1.1) * 4, .0001)
-			   .scale(.8,1,1)
-			   .scale(c1-c0,1,1)
-	                   .move(1,-1,0);
-	       }
-	    }
-	 }
+                           .move((c0*.4 + 9) * 4, -(row*.4 + nSelect + 3.1) * 4, .0001)
+                           .scale(.8 * (c1-c0), 1, 1)
+                           .move(1,-1,0);
+               }
+            }
+         }
       }
 
-      if (title)
-         title.child(1).opacity(1);
+      if (article && titleBar) {
+         titleBar.child(1).opacity(1);
+	 if (isInTitleBar == 'left' && isBesideBar('left', -1, -1)) {
+	    isOpen = ! isOpen;
+	    if (! isOpen) {
+	       nSelect = -1;
+	       isLocked = false;
+            }
+         }
+         titleBar.child(0).color(isInTitleBar == 'left' ? [0,.5,1] :
+	                         isInTitleBar == 'right' ? [1,0,0] : isOpen ? [1,1,1] : [1,.5,.5]);
+
+         // TO DELETE THE ARTICLE, SWIPE RIGHT ON ITS TITLE BAR WITH THE RIGHT HAND/CONTROLLER
+
+         if (isInTitleBar == 'right' && isBesideBar('right', -1, 1))
+            for (let n = 0 ; n < articleNodes.length ; n++)
+	       if (articleNodes[n] == this) {
+	          articleNodes.splice(n, 1);
+		  model.remove(article);
+	          return;
+	       }
+
+	 isInTitleBar = isInBar('left' , -1) ? 'left'  :
+	                isInBar('right', -1) ? 'right' : null;
+      }
+   }
+}
+
+let articleNodes = [];
+
+export const init = async model => {
+
+   // DECLARE THE LEFT AND RIGHT CONTROLLER BEAM INTERFACES
+
+   model.beam = {
+      left:  new ControllerBeam(model, 'left'),
+      right: new ControllerBeam(model, 'right')
+   };
+
+   //model.add('square').move(0,1.5,0).scale(.1);
+
+   articleNodes.push(new ArticleNode(model, 'Virtual reality'));
+   //articleNodes.push(new ArticleNode(model, 'Ken Perlin'));
+   //articleNodes[1].setPos([.4,0,0]);
+
+   inputEvents.onPress = hand => {
+      for (let n = 0 ; n < articleNodes.length ; n++)
+	 if (articleNodes[n].hasFocus()) {
+            articleNodes[n].onPress(hand);
+            inputEvents.onDrag = articleNodes[n].onDrag;
+            inputEvents.onRelease = articleNodes[n].onRelease;
+	    break;
+         }
+   }
+       
+   model.animate(() => {
+      model.beam.left.update();
+      model.beam.right.update();
+      for (let n = 0 ; n < articleNodes.length ; n++)
+         articleNodes[n].update();
    });
 }
+

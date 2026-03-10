@@ -490,7 +490,7 @@ export let mFromQuaternion = q =>
          2 * (q.y * q.x - q.z * q.w), 1 - 2 * (q.z * q.z + q.x * q.x),     2 * (q.x * q.w + q.y * q.z), 0,
          2 * (q.y * q.w + q.z * q.x),     2 * (q.z * q.y - q.x * q.w), 1 - 2 * (q.x * q.x + q.y * q.y), 0,  0,0,0,1 ];
 
-export let mHitRect = (beamMatrix, objMatrix) => {
+export let mHitRect = (beamMatrix, objMatrix, isAnyXY) => {
    let L = [[0,0,1,0],[1,0,0,1],[-1,0,0,1],[0,1,0,1],[0,-1,0,1]];
    let M = mTranspose(mMultiply(mInverse(objMatrix), beamMatrix));
    for (let i = 0 ; i < L.length ; i++)
@@ -499,9 +499,12 @@ export let mHitRect = (beamMatrix, objMatrix) => {
    if (z > 0)				// if rect is behind the beam
       return null;			//    then give up.
    let F = i => z * L[i][2] + L[i][3];  // x or y as a function of z.
-   for (let i = 1 ; i < L.length ; i++)
-      if (isNaN(F(i)) || F(i) < 0)	// if outside of any bounding plane
-         return null;			//    then give up.
+   if (isNaN(F(1)))
+      return null;
+   if (! isAnyXY)
+      for (let i = 1 ; i < L.length ; i++)
+         if (F(i) < 0)			// if outside of any bounding plane
+            return null;		//    then give up.
    return [F(1)-1, F(3)-1, -z];		// return [-1...1, -1...1, z-dist]
 }
 

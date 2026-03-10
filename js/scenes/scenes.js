@@ -32,6 +32,7 @@ export default () => {
          { name: "headGaze"     , path: "./headGaze.js"     , public: true },
          { name: "reading"      , path: "./reading.js"      , public: true },
          { name: "parse2"       , path: "./parse2.js"       , public: true },
+         { name: "parse3"       , path: "./parse3.js"       , public: true },
       ]
    };
 }
