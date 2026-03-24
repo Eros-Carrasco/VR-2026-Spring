@@ -377,6 +377,22 @@ export function G2(do_not_animate_flag=false, canvasWidth=512, canvasHeight) {
       }
    }
 
+   let curve = (n, f) => {
+      for (let i = 0 ; i <= n ; i++) { 
+         let p = f(i/n);
+         if (i == 0)
+            context.moveTo(x2c(p[0]), y2c(p[1]));
+         else
+            context.lineTo(x2c(p[0]), y2c(p[1]));
+      }
+   }
+
+   this.drawCurve = (n, f) => {
+      context.beginPath();
+      curve(n, f);
+      context.stroke();
+      return this;
+   }
    this.drawImage = (image,x,y,w,h,rotation, sx,sy,sw,sh) => {
       context.save();
          context.translate(x2c(x), y2c(y));
@@ -412,7 +428,7 @@ export function G2(do_not_animate_flag=false, canvasWidth=512, canvasHeight) {
          context.lineTo(x2c(x+w), y2c(y  ));
          context.lineTo(x2c(x+w), y2c(y+h));
          context.lineTo(x2c(x  ), y2c(y+h));
-         context.moveTo(x2c(x  ), y2c(y  ));
+         context.lineTo(x2c(x  ), y2c(y  ));
 	 context.stroke();
       }
       else {
@@ -420,6 +436,12 @@ export function G2(do_not_animate_flag=false, canvasWidth=512, canvasHeight) {
          context.roundRect(x2c(x),y2c(y+h),w2c(w),h2c(h),w2c(r));
          context.stroke();
       }
+      return this;
+   }
+   this.fillCurve = (n, f) => {
+      context.beginPath();
+      curve(n, f);
+      context.fill();
       return this;
    }
    this.fillOval = (x,y,w,h) => {

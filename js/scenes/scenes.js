@@ -21,6 +21,7 @@ export default () => {
          { name: "text4"        , path: "./text4.js"        , public: true },
          { name: "text5"        , path: "./text5.js"        , public: true },
          { name: "text6"        , path: "./text6.js"        , public: true },
+         { name: "text6WithAI"  , path: "./text6WithAI.js"  , public: true },
          { name: "text7"        , path: "./text7.js"        , public: true },
          { name: "text8"        , path: "./text8.js"        , public: true },
          { name: "dissolve"     , path: "./dissolve.js"     , public: true },
@@ -32,8 +33,11 @@ export default () => {
          { name: "headGaze"     , path: "./headGaze.js"     , public: true },
          { name: "reading"      , path: "./reading.js"      , public: true },
          { name: "parse2"       , path: "./parse2.js"       , public: true },
+
+         { name: "aiHelper"     , path: "./aiQuery.js"    , public: true },
          { name: "parse3"       , path: "./parse3.js"       , public: true },
+         { name: "arrange"      , path: "./arrange.js"      , public: true },
+         { name: "arrange2"     , path: "./arrange2.js"     , public: true },
       ]
    };
 }
-

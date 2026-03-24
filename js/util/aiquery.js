@@ -141,6 +141,21 @@ export class AIQuery {
      * @returns {Promise<string>} - Promise that resolves with the AI's response
      */
     askAI(prompt, options = {}) {
+        if (options.systemPrompt || options.messages) {
+            const messages = Array.isArray(options.messages) && options.messages.length
+                ? options.messages
+                : [
+                    { role: "system", content: options.systemPrompt || "You are a helpful assistant." },
+                    { role: "user", content: prompt }
+                ];
+            return this.queryFull("", { ...options, messages })
+                .then(data => {
+                    const message = data.message || {};
+                    const content = message.content || data.response || "";
+                    return content;
+                });
+        }
+
         return new Promise((resolve, reject) => {
             this.query(prompt, response => {
                 if (response.startsWith("Error:")) {
@@ -217,6 +232,52 @@ Here is the query: ${prompt}`;
     }
 
     /**
+     * Send a query and return the full server response (message, tool_calls, etc.)
+     * @param {string} queryText - The text of the query (optional if messages are provided)
+     * @param {Object} options - Additional options for this specific query
+     * @returns {Promise<Object>} - Promise that resolves with the full JSON response
+     */
+    queryFull(queryText, options = {}) {
+        const queryId = this.queryCounter++;
+        const timeoutMs = options.timeout || this.timeout;
+
+        return new Promise((resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+                reject(new Error('Query timed out'));
+            }, timeoutMs);
+
+            fetch(this.apiEndpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    query: queryText,
+                    queryId: queryId,
+                    ...options
+                })
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.text().then(text => {
+                        const detail = text ? ` ${text}` : "";
+                        throw new Error(`HTTP error! status: ${response.status}.${detail}`);
+                    });
+                }
+                return response.json();
+            })
+            .then(data => {
+                clearTimeout(timeoutId);
+                resolve(data);
+            })
+            .catch(error => {
+                clearTimeout(timeoutId);
+                reject(error);
+            });
+        });
+    }
+
+    /**
      * Send a query to the AI model
      * @param {string} queryText - The text of the query
      * @param {Function} callback - Function to call when response is received
@@ -283,6 +344,85 @@ Here is the query: ${prompt}`;
             });
         
         return queryId;
+    }
+
+    /**
+     * Run a tool-calling loop. The model can request tool executions, and results
+     * are fed back until it returns a final answer.
+     * @param {string} prompt - The user prompt
+     * @param {Array} tools - OpenAI tool schema array
+     * @param {Object} toolHandlers - Map of tool name -> async handler(args)
+     * @param {Object} options - { systemPrompt, model, toolChoice, parallelToolCalls, maxSteps, messages }
+     * @returns {Promise<string>} - The final assistant text response
+     */
+    async askAIWithTools(prompt, tools, toolHandlers = {}, options = {}) {
+        const systemPrompt = options.systemPrompt || "You are a helpful assistant in a WebXR environment. Use tools when needed.";
+        const toolChoice = options.toolChoice || "auto";
+        const parallelToolCalls = options.parallelToolCalls;
+        const maxSteps = options.maxSteps || 6;
+
+        let messages = Array.isArray(options.messages) && options.messages.length
+            ? options.messages.slice()
+            : [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: (prompt || "").toString() }
+            ];
+
+        for (let step = 0; step < maxSteps; step++) {
+            const data = await this.queryFull("", {
+                messages,
+                tools,
+                tool_choice: toolChoice,
+                ...(parallelToolCalls === undefined ? {} : { parallel_tool_calls: parallelToolCalls }),
+                model: options.model
+            });
+
+            const message = data.message || {};
+            const toolCalls = message.tool_calls || [];
+
+            if (!toolCalls.length) {
+                return message.content || data.response || "";
+            }
+
+            // Feed the tool call request back into the conversation.
+            messages.push({
+                role: "assistant",
+                content: message.content || null,
+                tool_calls: toolCalls
+            });
+
+            // Execute each tool call and append results.
+            for (const call of toolCalls) {
+                const toolName = call.function ? call.function.name : call.name;
+                const argsText = call.function ? call.function.arguments : call.arguments;
+                let args = {};
+                try {
+                    args = argsText ? JSON.parse(argsText) : {};
+                } catch (err) {
+                    args = { _error: `Failed to parse arguments: ${err.message}` };
+                }
+
+                let result;
+                const handler = toolHandlers[toolName];
+                if (!handler) {
+                    result = { error: `No handler registered for tool: ${toolName}` };
+                } else {
+                    try {
+                        result = await handler(args);
+                    } catch (err) {
+                        result = { error: err.message || String(err) };
+                    }
+                }
+
+                messages.push({
+                    role: "tool",
+                    tool_call_id: call.id || call.call_id,
+                    content: JSON.stringify(result === undefined ? null : result)
+                });
+            }
+        }
+
+        throw new Error(`Tool loop exceeded ${maxSteps} steps`);
     }
     
     /**
