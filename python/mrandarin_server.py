@@ -145,5 +145,5 @@ def health():
 
 
 if __name__ == '__main__':
-    print('MRandarin Vision Server starting on port 5050...')
-    app.run(host='0.0.0.0', port=5050, debug=False)
+    print('MRandarin Vision Server starting on port 1111...')
+    app.run(host='0.0.0.0', port=1111, debug=False)
