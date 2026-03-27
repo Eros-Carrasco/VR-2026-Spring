@@ -5,12 +5,14 @@ import numpy as np
 import cv2
 from PIL import Image
 import io
+from flask_cors import CORS
 
 # Apple Vision Framework
 import Vision
 import Quartz
 
 app = Flask(__name__)
+CORS(app)
 
 def is_chinese(text):
     """Check if text contains at least one Chinese character."""

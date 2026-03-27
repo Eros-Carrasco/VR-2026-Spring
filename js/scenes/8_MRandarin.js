@@ -2,7 +2,8 @@ import * as global from "../global.js";
 import { Gltf2Node } from "../render/nodes/gltf2.js";
 
 window.mandarinState = {
-   status: 'empty'
+   status: 'empty',
+   character: null
 };
 
 export const init = async model => {
@@ -58,31 +59,49 @@ export const init = async model => {
          }
       });
 
-      let lastLog = 0;
-      function hasDarkPixels() {
-         if (canvas.width <= 300 || canvas.height <= 150) return false;
-         const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-         let dark = 0;
-         for (let i = 0; i < data.length; i += 4) {
-            if ((data[i] + data[i+1] + data[i+2]) / 3 < 80) dark++;
+      // ── POLL THE PYTHON SERVER EVERY 2 SECONDS ──────────────────────
+      async function pollServer() {
+         if (canvas.width <= 300 || canvas.height <= 150) return; // not ready yet
+
+         try {
+            // grab current canvas frame as base64 PNG
+            const base64 = canvas.toDataURL('image/png').split(',')[1];
+
+            const response = await fetch('http://localhost:1111/predict', {
+               method: 'POST',
+               headers: { 'Content-Type': 'application/json' },
+               body: JSON.stringify({ image: base64 })
+            });
+
+            const result = await response.json();
+
+            if (result.character) {
+               console.log('recognized:', result.character, '(confidence:', result.confidence + ')');
+               mandarinState.status    = 'drawn';
+               mandarinState.character = result.character;
+            } else {
+               mandarinState.status    = 'empty';
+               mandarinState.character = null;
+            }
+
+         } catch(err) {
+            console.error('server error:', err);
          }
-         const now = Date.now();
-         if (now - lastLog > 1000) {
-            lastLog = now;
-            console.log('canvas:', canvas.width + 'x' + canvas.height, '| dark:', dark);
-         }
-         return dark >= 220000;
       }
 
+      // start polling loop
+      setInterval(pollServer, 2000);
+
+      // ── ANIMATION LOOP — MASTER CLIENT ──────────────────────────────
       model.animate(() => {
          mandarinState = server.synchronize('mandarinState');
-         mandarinState.status = hasDarkPixels() ? 'drawn' : 'empty';
          server.broadcastGlobal('mandarinState');
          sphere.color(mandarinState.status === 'drawn' ? 'green' : 'grey');
       });
 
    } else {
 
+      // ── ANIMATION LOOP — HEADSET ─────────────────────────────────────
       model.animate(() => {
          mandarinState = server.synchronize('mandarinState');
          sphere.color(mandarinState.status === 'drawn' ? 'green' : 'grey');
