@@ -34,8 +34,8 @@ def preprocess_image(image_bytes):
     # Convert to grayscale
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
 
-    # Threshold — pixels darker than 80 are stroke
-    _, binary = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+    # Threshold — pixels darker than 150 are stroke
+    _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
 
     # Find bounding box of all dark pixels
     coords = cv2.findNonZero(binary)
