@@ -1,23 +1,22 @@
 import base64
 from flask import Flask, request, jsonify
-import io
 from flask_cors import CORS
+from pypinyin import pinyin, Style
+from hanzipy.dictionary import HanziDictionary
 
-# Apple Vision Framework
 import Vision
 import Quartz
 
 app = Flask(__name__)
 CORS(app)
+dictionary = HanziDictionary()
 
 def is_chinese(text):
     """Check if text contains at least one Chinese character."""
     return any('\u4e00' <= char <= '\u9fff' for char in text)
 
 def run_vision_ocr(image_bytes):
-    """Run Apple Vision text recognition directly on raw PNG bytes."""
-
-    # Create CGImage from PNG bytes
+    """Run Apple Vision text recognition on raw PNG bytes."""
     data = Quartz.CFDataCreate(None, image_bytes, len(image_bytes))
     data_provider = Quartz.CGDataProviderCreateWithCFData(data)
     cg_image = Quartz.CGImageCreateWithPNGDataProvider(
@@ -36,13 +35,11 @@ def run_vision_ocr(image_bytes):
                 confidence = obs.topCandidates_(1)[0].confidence()
                 results.append((text, confidence))
 
-    # Create Vision request
     req = Vision.VNRecognizeTextRequest.alloc().initWithCompletionHandler_(handler)
     req.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
     req.setRecognitionLanguages_(['zh-Hans', 'zh-Hant'])
     req.setUsesLanguageCorrection_(False)
 
-    # Run request
     handler_obj = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(
         cg_image, {}
     )
@@ -59,16 +56,28 @@ def predict():
             return jsonify({ 'character': None, 'error': 'no image' })
 
         image_bytes = base64.b64decode(data['image'])
-
-        # Send raw image directly to Vision — no preprocessing
         ocr_results = run_vision_ocr(image_bytes)
 
-        # Find first Chinese character result
         for text, confidence in ocr_results:
             if is_chinese(text):
-                print(f'recognized: {text} (confidence: {confidence:.2f})')
+                # extract only the first Chinese character from the recognized text
+                char = next((c for c in text if '\u4e00' <= c <= '\u9fff'), None)
+                if not char:
+                    continue
+                py = pinyin(char, style=Style.TONE)[0][0]
+                definition = dictionary.definition_lookup(char)
+                # skip surname entries to get the actual meaning
+                meaning = next(
+                    (d['definition'] for d in definition if not d['definition'].startswith('surname')),
+                    definition[0]['definition'] if definition else 'unknown'
+                )
+                meaning = meaning.split('/CL:')[0]
+                meaning = '/'.join(meaning.split('/')[:3])
+                print(f'recognized: {char} {py} - {meaning} (confidence: {confidence:.2f})')
                 return jsonify({
-                    'character': text,
+                    'character': char,
+                    'pinyin':    py,
+                    'meaning':   meaning,
                     'confidence': round(float(confidence), 2)
                 })
 
