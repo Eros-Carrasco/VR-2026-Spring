@@ -70,7 +70,19 @@ export function G2(do_not_animate_flag=false, canvasWidth=512, canvasHeight) {
 
    this.update = () => {
       if (window.vr)
-         mouseZ = (lcb && lcb.down) || (rcb && rcb.down);
+         if (window.handtracking) {
+	    mouseZ = 0;
+	    if (inputEvents.isPressed('left')) {
+	       activeHand = 'left';
+	       mouseZ = 1;
+            }
+	    else if (inputEvents.isPressed('right')) {
+	       activeHand = 'right';
+	       mouseZ = 1;
+            }
+         }
+	 else
+            mouseZ = (lcb && lcb.down) || (rcb && rcb.down);
       mouseState = ! mouseZPrev && mouseZ ? 'press' :
                    ! mouseZ && mouseZPrev ? 'release' : mouseZ ? 'drag' : 'move';
       mouseZPrev = mouseZ;
@@ -109,6 +121,11 @@ export function G2(do_not_animate_flag=false, canvasWidth=512, canvasHeight) {
    this.drawWidgets = () => {
       for (let n = 0 ; n < widgets.length ; n++)
          widgets[n].draw();
+      if (window.handtracking) {
+         g2.setColor('red');
+         g2.fillRect(handPos[0]-.0015,-1,.003,2);
+         g2.fillRect(-1,handPos[1]-.0015,2,.003);
+      }
       return activeWidget != null;
    }
 
@@ -127,7 +144,7 @@ export function G2(do_not_animate_flag=false, canvasWidth=512, canvasHeight) {
       this.obj = obj;
       this.state = 0;
       g2.textHeight(.09 * size);
-      let w = textWidth(label) + .02 * size, h = .1 * size;
+      let w = textWidth(label[0]) + .02 * size, h = .1 * size;
       this.setLabel = str => label = str;
       this.isWithin = () => {
          let uvz = g2.getUVZ(obj);
@@ -142,6 +159,7 @@ export function G2(do_not_animate_flag=false, canvasWidth=512, canvasHeight) {
          }
       }
       this.draw = () => {
+         w = textWidth(label[this.state]) + .02 * size;
          let isPressed = this == activeWidget && (mouseState == 'press' || mouseState == 'drag');
          g2.textHeight(.045 * size);
          g2.setColor(color, isPressed ? .5 : this.isWithin() ? .7 : 1);
@@ -363,12 +381,22 @@ export function G2(do_not_animate_flag=false, canvasWidth=512, canvasHeight) {
       context.clearRect(0, 0, width, height);
       return this;
    }
+   let activeHand = 'left', handPos = [-2,-2,0];
    this.computeUVZ = objMatrix => {
       if (! window.vr) {
          let w = screen.width, h = screen.height;
          return cg.mHitRect(cg.mMultiply(cg.mInverse(views[0].viewMatrix),
                                          cg.mAimZ([.965*(1-mouseX/(w/2)),
                                                    .965*(mouseY/(w/2)-h/w),5])), objMatrix);
+      }
+      else if (window.handtracking) {
+	 let m = cg.mMultiply(cg.mInverse(objMatrix), worldCoords);
+	 let L = cg.mTransform(m, inputEvents.pos('left'));
+	 let R = cg.mTransform(m, inputEvents.pos('right'));
+	 let hitL = L[0] > -1 && L[0] < 1 && L[1] > -1 && L[1] < 1;
+	 let hitR = R[0] > -1 && R[0] < 1 && R[1] > -1 && R[1] < 1;
+	 activeHand = hitL && ! hitR ? 'left' : hitR && ! hitL ? 'right' : activeHand;
+	 return handPos = activeHand == 'left' ? L : R;
       }
       else {
          let L = lcb.hitRect(objMatrix);
@@ -552,7 +580,7 @@ export function G2(do_not_animate_flag=false, canvasWidth=512, canvasHeight) {
 
       let uh = .25 / values.length;
       if (labels)
-         this.textHeight(uh);
+         this.textHeight(.8 * uh);
 
       for (let n = 0 ; n < values.length ; n++) {
          let u = h * (n + .5) / values.length;
@@ -560,7 +588,7 @@ export function G2(do_not_animate_flag=false, canvasWidth=512, canvasHeight) {
             this.setColor(colors[n]);
          this.fillRect(x, y+u-uh/2, w * values[n], uh);
          if (labels)
-            this.fillText(labels[n], x-w/50, y+u, 'right', 0.5);
+            this.fillText(labels[n], x-.2*h, y+u, 'right');
       }
 
       this.setColor('black');
