@@ -18,7 +18,6 @@ export const init = async model => {
    let beams = { left : new ControllerBeam(model, 'left' ),   // CREATE THE CONTROLLER BEAMS
                  right: new ControllerBeam(model, 'right') }; //
 
-
    let g2 = new G2();                                         // CREATE THE 2D CANVAS, AND
    model.txtrSrc(2, g2.getCanvas());                          // DECLARE IT TO BE A TEXTURE SOURCE
 
