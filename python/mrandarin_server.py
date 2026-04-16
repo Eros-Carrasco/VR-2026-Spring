@@ -183,19 +183,23 @@ def predict():
 
         if len(centroids) == 4:
             normalized_bgr = normalize_image(bgr, centroids)
-            ocr_bytes = bgr_to_png_bytes(normalized_bgr)
             _debug_state['markers_found'] = True
             _debug_state['markers'] = centroids
             _debug_state['image'] = normalized_bgr.copy()
+            ocr_src = normalized_bgr
         else:
             if centroids:
                 logging.warning('Markers not found, using raw image (detected %d, need 4)', len(centroids))
             else:
                 logging.warning('Markers not found, using raw image')
-            ocr_bytes = image_bytes
             _debug_state['markers_found'] = False
             _debug_state['markers'] = centroids
             _debug_state['image'] = bgr.copy()
+            ocr_src = bgr
+
+        # Contrast enhancement — boosts stroke visibility for OCR
+        enhanced = cv2.convertScaleAbs(ocr_src, alpha=1.5, beta=0)
+        ocr_bytes = bgr_to_png_bytes(enhanced)
 
         _debug_state['character'] = None
         _debug_state['confidence'] = None
@@ -208,6 +212,9 @@ def predict():
                 # extract only the first Chinese character from the recognized text
                 char = next((c for c in text if '\u4e00' <= c <= '\u9fff'), None)
                 if not char:
+                    continue
+                if confidence < 0.5:
+                    print(f'Low confidence result: {char} ({confidence:.2f}), skipping')
                     continue
                 py = pinyin(char, style=Style.TONE)[0][0]
                 definition = dictionary.definition_lookup(char)
