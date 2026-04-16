@@ -7,7 +7,9 @@ window.mandarinState = {
    status:    'empty',
    character: null,
    pinyin:    null,
-   meaning:   null
+   meaning:   null,
+   bbox:      null,
+   erased:    false
 };
 
 export const init = async model => {
@@ -219,12 +221,17 @@ export const init = async model => {
                mandarinState.character = result.character;
                mandarinState.pinyin    = result.pinyin;
                mandarinState.meaning   = result.meaning;
-            } else {
+               mandarinState.bbox      = result.bbox ?? null;
+               mandarinState.erased    = false;
+            } else if (result.erased === true) {
                mandarinState.status    = 'empty';
                mandarinState.character = null;
                mandarinState.pinyin    = null;
                mandarinState.meaning   = null;
+               mandarinState.bbox      = null;
+               mandarinState.erased    = true;
             }
+            // else: server is locked — character still present, don't touch state
          } catch(err) {
             console.error('server error:', err);
          } finally {
@@ -244,8 +251,11 @@ export const init = async model => {
       if (clientID == clients[0])
          server.broadcastGlobal('mandarinState');
 
-      // When character changes, update display state and fetch wiki + AI
-      if (mandarinState.character !== lastCharacter) {
+      // When character changes, update display state and fetch wiki + AI.
+      // Only clear the display when status is explicitly 'empty' — not when
+      // character is null during locked state (server returns null no-ops).
+      if (mandarinState.character !== lastCharacter ||
+          (mandarinState.status === 'empty' && displayChar !== null)) {
          lastCharacter  = mandarinState.character;
          displayChar    = mandarinState.character;
          displayPinyin  = mandarinState.pinyin;

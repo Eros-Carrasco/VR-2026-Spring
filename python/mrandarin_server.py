@@ -25,6 +25,8 @@ _debug_state = {
     'character': None,
     'confidence': None,
     'timestamp': None,
+    'locked': False,
+    'locked_bbox': None,  # (x, y, w, h) pixel coords of locked character
 }
 
 def detect_markers(bgr_image):
@@ -151,7 +153,8 @@ def run_vision_ocr(image_bytes):
             for obs in observations:
                 text = obs.topCandidates_(1)[0].string()
                 confidence = obs.topCandidates_(1)[0].confidence()
-                results.append((text, confidence))
+                bb = obs.boundingBox()  # CGRect normalized, origin bottom-left
+                results.append((text, confidence, bb))
 
     req = Vision.VNRecognizeTextRequest.alloc().initWithCompletionHandler_(handler)
     req.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
@@ -166,6 +169,22 @@ def run_vision_ocr(image_bytes):
     return results
 
 
+def check_if_erased(bgr, bbox):
+    """Return True if the bbox region contains fewer than 2% dark pixels (< 80 gray)."""
+    x, y, w, h = bbox
+    # Clamp to image bounds
+    img_h, img_w = bgr.shape[:2]
+    x1, y1 = max(x, 0), max(y, 0)
+    x2, y2 = min(x + w, img_w), min(y + h, img_h)
+    region = bgr[y1:y2, x1:x2]
+    if region.size == 0:
+        return True
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    dark_count = int(np.sum(gray < 80))
+    total = gray.size
+    return dark_count < 0.02 * total
+
+
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
@@ -175,10 +194,27 @@ def predict():
 
         image_bytes = base64.b64decode(data['image'])
 
-        # --- Marker detection & image normalization ---
         np_arr = np.frombuffer(image_bytes, dtype=np.uint8)
         bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
+        # --- Lock-on: skip OCR while a character is locked, check for erase instead ---
+        if _debug_state['locked']:
+            centroids = detect_markers(bgr)
+            if len(centroids) == 4:
+                check_src = normalize_image(bgr, centroids)
+            else:
+                check_src = bgr
+            if check_if_erased(check_src, _debug_state['locked_bbox']):
+                print('character erased — unlocking')
+                _debug_state['locked'] = False
+                _debug_state['locked_bbox'] = None
+                _debug_state['character'] = None
+                _debug_state['confidence'] = None
+                _debug_state['timestamp'] = datetime.now().isoformat(timespec='seconds')
+                return jsonify({ 'character': None, 'erased': True })
+            return jsonify({ 'character': None })
+
+        # --- Marker detection & image normalization ---
         centroids = detect_markers(bgr)
 
         if len(centroids) == 4:
@@ -207,7 +243,9 @@ def predict():
 
         ocr_results = run_vision_ocr(ocr_bytes)
 
-        for text, confidence in ocr_results:
+        img_h, img_w = bgr.shape[:2]
+
+        for text, confidence, bb in ocr_results:
             if is_chinese(text):
                 # extract only the first Chinese character from the recognized text
                 char = next((c for c in text if '\u4e00' <= c <= '\u9fff'), None)
@@ -225,14 +263,25 @@ def predict():
                 )
                 meaning = meaning.split('/CL:')[0]
                 meaning = '/'.join(meaning.split('/')[:3])
+
+                # Convert Vision's normalized bottom-left bbox to pixel coords
+                bx = int(bb.origin.x * img_w)
+                by = int((1 - bb.origin.y - bb.size.height) * img_h)
+                bw = int(bb.size.width * img_w)
+                bh = int(bb.size.height * img_h)
+                bbox_pixels = (bx, by, bw, bh)
+
                 print(f'recognized: {char} {py} - {meaning} (confidence: {confidence:.2f})')
                 _debug_state['character'] = char
                 _debug_state['confidence'] = round(float(confidence), 2)
+                _debug_state['locked'] = True
+                _debug_state['locked_bbox'] = bbox_pixels
                 return jsonify({
                     'character': char,
                     'pinyin':    py,
                     'meaning':   meaning,
-                    'confidence': round(float(confidence), 2)
+                    'confidence': round(float(confidence), 2),
+                    'bbox':      bbox_pixels,
                 })
 
         print('no chinese character recognized')
