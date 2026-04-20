@@ -15,6 +15,9 @@ import Quartz
 
 app = Flask(__name__)
 CORS(app)
+
+# Suppress Flask's per-request access log — only show errors
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
 dictionary = HanziDictionary()
 
 # Debug state shared between /predict and /debug
@@ -202,10 +205,15 @@ def predict():
             centroids = detect_markers(bgr)
             if len(centroids) == 4:
                 check_src = normalize_image(bgr, centroids)
+                _debug_state['image'] = check_src.copy()
+                _debug_state['markers_found'] = True
+                _debug_state['markers'] = centroids
             else:
                 check_src = bgr
+                _debug_state['image'] = bgr.copy()
+                _debug_state['markers_found'] = False
+                _debug_state['markers'] = centroids
             if check_if_erased(check_src, _debug_state['locked_bbox']):
-                print('character erased — unlocking')
                 _debug_state['locked'] = False
                 _debug_state['locked_bbox'] = None
                 _debug_state['character'] = None
@@ -284,7 +292,6 @@ def predict():
                     'bbox':      bbox_pixels,
                 })
 
-        print('no chinese character recognized')
         return jsonify({ 'character': None })
 
     except Exception as e:
