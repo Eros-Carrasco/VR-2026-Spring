@@ -72,56 +72,45 @@ def order_corners(pts):
 
 
 def normalize_image(bgr_image, centroids):
-    """Perspective-correct the region inside 4 marker centroids in-place.
-
-    Output dimensions are always identical to the input.  Everything outside
-    the marker polygon is white; the interior is perspective-corrected and
-    placed back at the same screen position.
-    """
+    """Perspective-correct the marker region into a fixed 800x800 square centered in the output image."""
     h, w = bgr_image.shape[:2]
     ordered = order_corners(centroids)   # [TL, TR, BR, BL]
-    tl, tr, br, bl = ordered
 
-    # Bounding box of the marker quad in the original image
-    x_min = min(p[0] for p in ordered)
-    y_min = min(p[1] for p in ordered)
-    x_max = max(p[0] for p in ordered)
-    y_max = max(p[1] for p in ordered)
-    bbox_w = x_max - x_min
-    bbox_h = y_max - y_min
+    cx, cy = w // 2, h // 2
+    half = 400
 
-    # Map the 4 marker corners → corners of the bounding-box rectangle
     src = np.array(ordered, dtype=np.float32)
     dst = np.array([
-        [x_min, y_min],
-        [x_max, y_min],
-        [x_max, y_max],
-        [x_min, y_max],
+        [cx - half, cy - half],  # top-left
+        [cx + half, cy - half],  # top-right
+        [cx + half, cy + half],  # bottom-right
+        [cx - half, cy + half],  # bottom-left
     ], dtype=np.float32)
 
     H = cv2.getPerspectiveTransform(src, dst)
 
-    # Warp the whole image with the same homography — keeps all coordinates in
-    # the original image space so we can composite without any offset arithmetic
     warped_full = cv2.warpPerspective(bgr_image, H, (w, h),
                                       borderMode=cv2.BORDER_CONSTANT,
                                       borderValue=(255, 255, 255))
 
-    # Build a polygon mask for the bounding-box rectangle
-    rect_poly = np.array([[x_min, y_min], [x_max, y_min],
-                           [x_max, y_max], [x_min, y_max]], dtype=np.int32)
+    # Mask for the fixed 800x800 destination region
+    rect_poly = np.array([
+        [cx - half, cy - half],
+        [cx + half, cy - half],
+        [cx + half, cy + half],
+        [cx - half, cy + half],
+    ], dtype=np.int32)
     region_mask = np.zeros((h, w), dtype=np.uint8)
     cv2.fillPoly(region_mask, [rect_poly], 255)
 
-    # White canvas — same size as input
     canvas = np.full_like(bgr_image, 255)
-
-    # Paste the warped region into the canvas, leave everything else white
     canvas[region_mask == 255] = warped_full[region_mask == 255]
 
-    # Erase the marker dots so the red circles don't confuse OCR
-    for (x, y) in [tl, tr, br, bl]:
-        cv2.circle(canvas, (x, y), 40, (255, 255, 255), -1)
+    # Erase marker dots at their transformed positions in the output space
+    src_pts = np.array([ordered], dtype=np.float32)
+    dst_pts = cv2.perspectiveTransform(src_pts, H)[0]
+    for (x, y) in dst_pts:
+        cv2.circle(canvas, (int(x), int(y)), 40, (255, 255, 255), -1)
 
     return canvas
 
