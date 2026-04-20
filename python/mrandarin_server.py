@@ -20,6 +20,12 @@ CORS(app)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 dictionary = HanziDictionary()
 
+_homography_state = {
+    'H': None,
+    'dst': None,
+    'locked': False,
+}
+
 # Debug state shared between /predict and /debug
 _debug_state = {
     'image': None,       # numpy BGR image (annotated copy)
@@ -88,6 +94,9 @@ def normalize_image(bgr_image, centroids):
     ], dtype=np.float32)
 
     H = cv2.getPerspectiveTransform(src, dst)
+    _homography_state['H'] = H
+    _homography_state['dst'] = dst.copy()
+    _homography_state['locked'] = True
 
     warped_full = cv2.warpPerspective(bgr_image, H, (w, h),
                                       borderMode=cv2.BORDER_CONSTANT,
@@ -113,6 +122,40 @@ def normalize_image(bgr_image, centroids):
         cv2.circle(canvas, (int(x), int(y)), 40, (255, 255, 255), -1)
 
     return canvas
+
+
+def apply_homography(bgr_image):
+    """Apply the saved homography to a new frame (used when live markers are unavailable)."""
+    H = _homography_state['H']
+    h, w = bgr_image.shape[:2]
+    cx, cy = w // 2, h // 2
+    half = 400
+    warped_full = cv2.warpPerspective(bgr_image, H, (w, h),
+                                      borderMode=cv2.BORDER_CONSTANT,
+                                      borderValue=(255, 255, 255))
+    rect_poly = np.array([
+        [cx - half, cy - half],
+        [cx + half, cy - half],
+        [cx + half, cy + half],
+        [cx - half, cy + half],
+    ], dtype=np.int32)
+    region_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(region_mask, [rect_poly], 255)
+    canvas = np.full_like(bgr_image, 255)
+    canvas[region_mask == 255] = warped_full[region_mask == 255]
+    return canvas
+
+
+def is_valid_quad(centroids):
+    """Return True if 4 centroids form a reasonable quadrilateral."""
+    pts = np.array(order_corners(centroids), dtype=np.float32)
+    if cv2.contourArea(pts) < 10000:
+        return False
+    for i in range(4):
+        for j in range(i + 1, 4):
+            if np.linalg.norm(pts[i] - pts[j]) < 100:
+                return False
+    return True
 
 
 def bgr_to_png_bytes(bgr_image):
@@ -192,16 +235,20 @@ def predict():
         # --- Lock-on: skip OCR while a character is locked, check for erase instead ---
         if _debug_state['locked']:
             centroids = detect_markers(bgr)
-            if len(centroids) == 4:
+            valid_quad = len(centroids) == 4 and is_valid_quad(centroids)
+            if valid_quad:
                 check_src = normalize_image(bgr, centroids)
-                _debug_state['image'] = check_src.copy()
                 _debug_state['markers_found'] = True
+                _debug_state['markers'] = centroids
+            elif _homography_state['locked']:
+                check_src = apply_homography(bgr)
+                _debug_state['markers_found'] = False
                 _debug_state['markers'] = centroids
             else:
                 check_src = bgr
-                _debug_state['image'] = bgr.copy()
                 _debug_state['markers_found'] = False
                 _debug_state['markers'] = centroids
+            _debug_state['image'] = check_src.copy()
             if check_if_erased(check_src, _debug_state['locked_bbox']):
                 _debug_state['locked'] = False
                 _debug_state['locked_bbox'] = None
@@ -213,10 +260,21 @@ def predict():
 
         # --- Marker detection & image normalization ---
         centroids = detect_markers(bgr)
+        valid_quad = len(centroids) == 4 and is_valid_quad(centroids)
 
-        if len(centroids) == 4:
+        if valid_quad:
             normalized_bgr = normalize_image(bgr, centroids)
             _debug_state['markers_found'] = True
+            _debug_state['markers'] = centroids
+            _debug_state['image'] = normalized_bgr.copy()
+            ocr_src = normalized_bgr
+        elif _homography_state['locked']:
+            if len(centroids) == 4:
+                logging.warning('Quad invalid (area or clustering), using frozen homography')
+            else:
+                logging.warning('Markers not found (%d detected), using frozen homography', len(centroids))
+            normalized_bgr = apply_homography(bgr)
+            _debug_state['markers_found'] = False
             _debug_state['markers'] = centroids
             _debug_state['image'] = normalized_bgr.copy()
             ocr_src = normalized_bgr
