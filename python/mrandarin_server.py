@@ -20,12 +20,6 @@ CORS(app)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 dictionary = HanziDictionary()
 
-_homography_state = {
-    'H': None,
-    'dst': None,
-    'locked': False,
-}
-
 # Debug state shared between /predict and /debug
 _debug_state = {
     'image': None,       # numpy BGR image (annotated copy)
@@ -94,9 +88,6 @@ def normalize_image(bgr_image, centroids):
     ], dtype=np.float32)
 
     H = cv2.getPerspectiveTransform(src, dst)
-    _homography_state['H'] = H
-    _homography_state['dst'] = dst.copy()
-    _homography_state['locked'] = True
 
     warped_full = cv2.warpPerspective(bgr_image, H, (w, h),
                                       borderMode=cv2.BORDER_CONSTANT,
@@ -121,28 +112,6 @@ def normalize_image(bgr_image, centroids):
     for (x, y) in dst_pts:
         cv2.circle(canvas, (int(x), int(y)), 40, (255, 255, 255), -1)
 
-    return canvas
-
-
-def apply_homography(bgr_image):
-    """Apply the saved homography to a new frame (used when live markers are unavailable)."""
-    H = _homography_state['H']
-    h, w = bgr_image.shape[:2]
-    cx, cy = w // 2, h // 2
-    half = 400
-    warped_full = cv2.warpPerspective(bgr_image, H, (w, h),
-                                      borderMode=cv2.BORDER_CONSTANT,
-                                      borderValue=(255, 255, 255))
-    rect_poly = np.array([
-        [cx - half, cy - half],
-        [cx + half, cy - half],
-        [cx + half, cy + half],
-        [cx - half, cy + half],
-    ], dtype=np.int32)
-    region_mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(region_mask, [rect_poly], 255)
-    canvas = np.full_like(bgr_image, 255)
-    canvas[region_mask == 255] = warped_full[region_mask == 255]
     return canvas
 
 
@@ -236,18 +205,16 @@ def predict():
         if _debug_state['locked']:
             centroids = detect_markers(bgr)
             valid_quad = len(centroids) == 4 and is_valid_quad(centroids)
-            if valid_quad:
-                check_src = normalize_image(bgr, centroids)
-                _debug_state['markers_found'] = True
-                _debug_state['markers'] = centroids
-            elif _homography_state['locked']:
-                check_src = apply_homography(bgr)
+            if not valid_quad:
+                # Can't reliably check erase without all 4 markers; pause without dropping lock.
                 _debug_state['markers_found'] = False
                 _debug_state['markers'] = centroids
-            else:
-                check_src = bgr
-                _debug_state['markers_found'] = False
-                _debug_state['markers'] = centroids
+                _debug_state['image'] = bgr.copy()
+                return jsonify({'character': None})
+            # Valid quad — normalize and run the erase check
+            check_src = normalize_image(bgr, centroids)
+            _debug_state['markers_found'] = True
+            _debug_state['markers'] = centroids
             _debug_state['image'] = check_src.copy()
             if check_if_erased(check_src, _debug_state['locked_bbox']):
                 _debug_state['locked'] = False
@@ -255,38 +222,34 @@ def predict():
                 _debug_state['character'] = None
                 _debug_state['confidence'] = None
                 _debug_state['timestamp'] = datetime.now().isoformat(timespec='seconds')
-                return jsonify({ 'character': None, 'erased': True })
-            return jsonify({ 'character': None })
+                return jsonify({'character': None, 'erased': True})
+            return jsonify({'character': None})
+
+        img_h, img_w = bgr.shape[:2]
 
         # --- Marker detection & image normalization ---
         centroids = detect_markers(bgr)
         valid_quad = len(centroids) == 4 and is_valid_quad(centroids)
 
-        if valid_quad:
-            normalized_bgr = normalize_image(bgr, centroids)
-            _debug_state['markers_found'] = True
-            _debug_state['markers'] = centroids
-            _debug_state['image'] = normalized_bgr.copy()
-            ocr_src = normalized_bgr
-        elif _homography_state['locked']:
-            if len(centroids) == 4:
-                logging.warning('Quad invalid (area or clustering), using frozen homography')
-            else:
-                logging.warning('Markers not found (%d detected), using frozen homography', len(centroids))
-            normalized_bgr = apply_homography(bgr)
-            _debug_state['markers_found'] = False
-            _debug_state['markers'] = centroids
-            _debug_state['image'] = normalized_bgr.copy()
-            ocr_src = normalized_bgr
-        else:
+        if not valid_quad:
+            # Strict mode: no recognition without a valid quad of 4 markers.
             if centroids:
-                logging.warning('Markers not found, using raw image (detected %d, need 4)', len(centroids))
+                logging.warning('Markers not found (%d detected), skipping OCR (strict mode)', len(centroids))
             else:
-                logging.warning('Markers not found, using raw image')
+                logging.warning('Markers not found (0 detected), skipping OCR (strict mode)')
             _debug_state['markers_found'] = False
             _debug_state['markers'] = centroids
             _debug_state['image'] = bgr.copy()
-            ocr_src = bgr
+            return jsonify({'character': None})
+
+        # Valid quad path
+        normalized_bgr = normalize_image(bgr, centroids)
+        _debug_state['markers_found'] = True
+        _debug_state['markers'] = centroids
+        _debug_state['image'] = normalized_bgr.copy()
+        ocr_src = normalized_bgr
+        ordered = order_corners(centroids)
+        src_corners_norm = [[x / img_w, y / img_h] for (x, y) in ordered]
 
         # Contrast enhancement — boosts stroke visibility for OCR
         enhanced = cv2.convertScaleAbs(ocr_src, alpha=1.5, beta=0)
@@ -297,8 +260,6 @@ def predict():
         _debug_state['timestamp'] = datetime.now().isoformat(timespec='seconds')
 
         ocr_results = run_vision_ocr(ocr_bytes)
-
-        img_h, img_w = bgr.shape[:2]
 
         for text, confidence, bb in ocr_results:
             if is_chinese(text):
@@ -326,17 +287,34 @@ def predict():
                 bh = int(bb.size.height * img_h)
                 bbox_pixels = (bx, by, bw, bh)
 
+                # Normalized position within the 800×800 detection zone
+                # Zone is centered in the full image; top-left corner at (img_w/2-400, img_h/2-400)
+                zone_left = img_w / 2 - 400
+                zone_top  = img_h / 2 - 400
+                char_cx   = bx + bw / 2
+                char_cy   = by + bh / 2
+                char_x_pct = max(0.0, min(1.0, (char_cx - zone_left) / 800))
+                char_y_pct = max(0.0, min(1.0, (char_cy - zone_top)  / 800))
+                bbox_w_pct = max(0.0, min(1.0, bw / 800))
+                bbox_h_pct = max(0.0, min(1.0, bh / 800))
+
                 print(f'recognized: {char} {py} - {meaning} (confidence: {confidence:.2f})')
                 _debug_state['character'] = char
                 _debug_state['confidence'] = round(float(confidence), 2)
                 _debug_state['locked'] = True
                 _debug_state['locked_bbox'] = bbox_pixels
                 return jsonify({
-                    'character': char,
-                    'pinyin':    py,
-                    'meaning':   meaning,
-                    'confidence': round(float(confidence), 2),
-                    'bbox':      bbox_pixels,
+                    'character':   char,
+                    'pinyin':      py,
+                    'meaning':     meaning,
+                    'confidence':  round(float(confidence), 2),
+                    'bbox':        bbox_pixels,
+                    'char_x_pct':  round(char_x_pct, 4),
+                    'char_y_pct':  round(char_y_pct, 4),
+                    'bbox_w_pct':  round(bbox_w_pct, 4),
+                    'bbox_h_pct':  round(bbox_h_pct, 4),
+                    # Marker corners [TL, TR, BR, BL] in original image space, normalized 0-1
+                    'src_corners': [[round(x, 4), round(y, 4)] for (x, y) in src_corners_norm] if src_corners_norm else None,
                 })
 
         return jsonify({ 'character': None })
