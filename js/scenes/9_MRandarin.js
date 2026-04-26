@@ -11,7 +11,11 @@ window.mandarinState = {
    pinyin:    null,
    meaning:   null,
    erased:    false,
-   panelMatrix: null,   // 16-float matrix: square→world (markers' plane in world space)
+   // Source corners + frame dimensions used to compute the pose locally on each
+   // client (so the headset uses ITS OWN viewMatrix, not the PC's static one).
+   srcCorners: null,
+   frameW:     0,
+   frameH:     0,
 };
 
 export const init = async model => {
@@ -68,7 +72,6 @@ export const init = async model => {
    // ── PC-only debug overlay (created later if we are master) ────────────────
    let debugDiv = null;                  // HTML <div> shown on the PC window
    let lastServerResult = null;          // last raw response from /predict
-   let lastPoseLog = null;               // last pose-computation summary
 
    // ── G2 render functions ───────────────────────────────────────────────────
    g2Char.render = function () {
@@ -203,12 +206,14 @@ export const init = async model => {
    // ── MASTER CLIENT (PC) ONLY ──────────────────────────────────────────────
    if (clientID == clients[0]) {
 
-      mandarinState.status      = 'empty';
-      mandarinState.character   = null;
-      mandarinState.pinyin      = null;
-      mandarinState.meaning     = null;
-      mandarinState.erased      = false;
-      mandarinState.panelMatrix = null;
+      mandarinState.status     = 'empty';
+      mandarinState.character  = null;
+      mandarinState.pinyin     = null;
+      mandarinState.meaning    = null;
+      mandarinState.erased     = false;
+      mandarinState.srcCorners = null;
+      mandarinState.frameW     = 0;
+      mandarinState.frameH     = 0;
 
       let canvas = document.createElement('canvas');
       let ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -281,9 +286,6 @@ export const init = async model => {
          if (canvas.width <= 300 || canvas.height <= 150) return;
          isPolling = true;
 
-         // Snapshot the headset's view matrix at the moment we send the frame.
-         // Using lastViewMatrix (updated each animate tick) keeps capture and pose aligned.
-         const captureView = lastViewMatrix ? lastViewMatrix.slice() : null;
          const frameW = canvas.width;
          const frameH = canvas.height;
 
@@ -298,72 +300,27 @@ export const init = async model => {
             lastServerResult = result;
             console.log('[MRandarin] server result:', JSON.stringify(result));
             if (result.character) {
-               mandarinState.status    = 'drawn';
-               mandarinState.character = result.character;
-               mandarinState.pinyin    = result.pinyin;
-               mandarinState.meaning   = result.meaning;
-               mandarinState.erased    = false;
-
-               // ── Compute square→world pose from the 4 red markers ──────────
-               // result.src_corners is [TL, TR, BR, BL] in image coords, normalized 0..1
-               // (each axis divided by its own dimension — server line src_corners_norm).
-               // computeCameraPose expects 8 (u,v) values matching the model order
-               // S = [BL, BR, TR, TL] in math convention (y up).
-               // So we reorder TL/TR/BR/BL → BL/BR/TR/TL, center on 0, flip y, and
-               // correct for image aspect ratio (server normalizes x and y separately).
-               if (result.src_corners && captureView) {
-                  const src = result.src_corners;
-                  const reordered = [src[3], src[2], src[1], src[0]]; // → [BL, BR, TR, TL]
-                  const aspect = frameH / frameW;
-                  const C = [];
-                  for (const [u, v] of reordered) {
-                     C.push(u - 0.5);
-                     C.push(-(v - 0.5) * aspect);   // image y is down; flip + aspect-correct
-                  }
-                  const squareToCameraCV = computeCameraPose(C, SQUARE_FL, SQUARE_SIZE);
-                  // computeCameraPose returns the pose in CV convention (camera looks
-                  // toward +z). The framework / WebXR uses GL convention (camera looks
-                  // toward -z). Flip the z column to convert between them.
-                  const flipZ = [1,0,0,0,  0,1,0,0,  0,0,-1,0,  0,0,0,1];
-                  const squareToCamera = mxm(flipZ, squareToCameraCV);
-                  // captureView is camera→world (inverseViewMatrix), so
-                  // square→world = captureView · square→camera
-                  const M_world = mxm(captureView, squareToCamera);
-                  // Convert world space (system A) → model space (system B), where
-                  // model nodes live. When worldCoords = identity these are the same;
-                  // when the user has pinched to move the world, this keeps the panels
-                  // anchored correctly.
-                  const inverseWC = (typeof clay !== 'undefined' && clay.inverseRootMatrix)
-                     ? clay.inverseRootMatrix
-                     : [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
-                  const M = mxm(inverseWC, M_world);
-                  const hasNaN = M.some(n => !isFinite(n));
-                  mandarinState.panelMatrix = hasNaN ? null : M;
-
-                  lastPoseLog = {
-                     ok:        !hasNaN,
-                     character: result.character,
-                     center:    [M[12], M[13], M[14]],
-                     headPos:   [captureView[12], captureView[13], captureView[14]],
-                     hasNaN,
-                  };
-                  console.log('[MRandarin] pose computed:', lastPoseLog);
-               } else {
-                  console.warn('[MRandarin] no src_corners or captureView; panels will not appear');
-                  mandarinState.panelMatrix = null;
-                  lastPoseLog = {
-                     ok: false,
-                     reason: !result.src_corners ? 'no src_corners in result' : 'no captureView',
-                  };
-               }
+               mandarinState.status     = 'drawn';
+               mandarinState.character  = result.character;
+               mandarinState.pinyin     = result.pinyin;
+               mandarinState.meaning    = result.meaning;
+               mandarinState.erased     = false;
+               // Publish the raw image-space corner coordinates and frame dims.
+               // Each client (in particular the headset) computes its OWN pose from
+               // these, using its own current viewMatrix — so panels appear anchored
+               // to the user's actual head pose, not the PC's static one.
+               mandarinState.srcCorners = result.src_corners || null;
+               mandarinState.frameW     = frameW;
+               mandarinState.frameH     = frameH;
             } else if (result.erased === true) {
-               mandarinState.status      = 'empty';
-               mandarinState.character   = null;
-               mandarinState.pinyin      = null;
-               mandarinState.meaning     = null;
-               mandarinState.erased      = true;
-               mandarinState.panelMatrix = null;
-               lastPoseLog = null;
+               mandarinState.status     = 'empty';
+               mandarinState.character  = null;
+               mandarinState.pinyin     = null;
+               mandarinState.meaning    = null;
+               mandarinState.erased     = true;
+               mandarinState.srcCorners = null;
+               mandarinState.frameW     = 0;
+               mandarinState.frameH     = 0;
             }
             // else: server is locked — no change
          } catch (err) {
@@ -379,7 +336,45 @@ export const init = async model => {
    // ── ALL CLIENTS ───────────────────────────────────────────────────────────
    let lastCharacter = undefined;
    let lastFetchedMeaning = null;
-   let lastViewMatrix = null;   // refreshed every animate tick; read by pollServer
+   let lastViewMatrix = null;          // refreshed every animate tick
+   let localPanelMatrix = null;        // computed locally on this client (uses LOCAL viewMatrix)
+
+   // Build a square→model-space pose from the four image-space corners returned
+   // by the server. Uses THIS client's current inverseViewMatrix(0), so when run
+   // on the headset the result is anchored to the user's actual head pose.
+   function computeLocalPanelMatrix(srcCorners, frameW, frameH) {
+      if (!srcCorners || !frameW || !frameH) return null;
+
+      // Server gives [TL, TR, BR, BL] (image, normalized 0..1).
+      // computeCameraPose's model order is [BL, BR, TR, TL] (math convention, y up).
+      const reordered = [srcCorners[3], srcCorners[2], srcCorners[1], srcCorners[0]];
+      const aspect = frameH / frameW;
+      const C = [];
+      for (const [u, v] of reordered) {
+         C.push(u - 0.5);
+         C.push(-(v - 0.5) * aspect);   // image y is down; flip + aspect-correct
+      }
+
+      const squareToCameraCV = computeCameraPose(C, SQUARE_FL, SQUARE_SIZE);
+      // CV convention (camera looks +z) → GL/WebXR convention (camera looks -z).
+      const flipZ = [1,0,0,0,  0,1,0,0,  0,0,-1,0,  0,0,0,1];
+      const squareToCamera = mxm(flipZ, squareToCameraCV);
+
+      // Use THIS client's current camera→world transform.
+      const captureView = clay.root().inverseViewMatrix(0);
+      const M_world = mxm(captureView, squareToCamera);
+
+      // Convert world space (system A) → model space (system B), where panel
+      // nodes live. With worldCoords = identity these match; if the user has
+      // pinched to move/rotate the world, this keeps panels anchored correctly.
+      const inverseWC = (typeof clay !== 'undefined' && clay.inverseRootMatrix)
+         ? clay.inverseRootMatrix
+         : [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+      const M = mxm(inverseWC, M_world);
+
+      if (M.some(n => !isFinite(n))) return null;
+      return M;
+   }
 
    model.animate(() => {
       mandarinState = server.synchronize('mandarinState');
@@ -387,7 +382,7 @@ export const init = async model => {
          server.broadcastGlobal('mandarinState');
       }
 
-      // Keep the latest view matrix around so pollServer can snapshot it.
+      // Keep the latest view matrix around for diagnostics.
       const _inv = clay.root().inverseViewMatrix(0);
       lastViewMatrix = [
          _inv[0],  _inv[1],  _inv[2],  _inv[3],
@@ -407,6 +402,15 @@ export const init = async model => {
             displayMeaning = mandarinState.meaning;
             displayImage   = null;
             displayAI      = null;
+            // ── Compute the panel pose LOCALLY using this client's viewMatrix ──
+            // On the headset, this means panels anchor to where the user's head
+            // actually is right now (not where the PC's static view says it is).
+            // On the PC master, this still runs but the result is mostly meaningless
+            // because the PC has no real XR view — its panels stay invisible because
+            // they're in screen-space rather than the user's view anyway.
+            localPanelMatrix = computeLocalPanelMatrix(
+               mandarinState.srcCorners, mandarinState.frameW, mandarinState.frameH
+            );
             if (mandarinState.meaning !== lastFetchedMeaning) {
                lastFetchedMeaning = mandarinState.meaning;
                if (clientID != clients[0]) {
@@ -415,6 +419,7 @@ export const init = async model => {
             }
          } else {
             hidePanels();
+            localPanelMatrix = null;
          }
       }
 
@@ -440,17 +445,12 @@ export const init = async model => {
       }
 
       // ── Place the 4 info panels in the world, anchored to the marker square ──
-      // No marker pose yet (or character cleared) → hide all four panels.
-      const M = mandarinState.panelMatrix;
+      const M = localPanelMatrix;
       if (M && displayChar) {
-         // The marker square lives in its own plane: x=right, y=up, z=normal.
-         // Extract those axes from M (which is square→world).
-         const rx = [M[0], M[1], M[2]];   // right axis of the square, in world space
-         const uy = [M[4], M[5], M[6]];   // up axis of the square, in world space
-         const nz = [M[8], M[9], M[10]];  // normal of the square (out of the wall)
+         const rx = [M[0], M[1], M[2]];
+         const uy = [M[4], M[5], M[6]];
+         const nz = [M[8], M[9], M[10]];
 
-         // Four corners of the model square at (±s/2, ±s/2, 0), then scaled by spread,
-         // mapped to world via M.
          const half = (SQUARE_SIZE / 2) * PANEL_SPREAD;
          const cornerTL = transform(M, [-half,  half, 0]);
          const cornerTR = transform(M, [ half,  half, 0]);
@@ -471,7 +471,6 @@ export const init = async model => {
          placePanelAt(panelImage,  cornerBL);
          placePanelAt(panelAI,     cornerBR);
       } else {
-         // Push panels far out of sight when there's nothing to show.
          const hidden = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,-999,0,1];
          panelChar  .setMatrix(hidden);
          panelPinyin.setMatrix(hidden);
@@ -486,13 +485,9 @@ export const init = async model => {
 
       // ── PC debug overlay update ───────────────────────────────────────────
       if (debugDiv) {
-         const M = mandarinState.panelMatrix;
-         const head = lastViewMatrix
-            ? [lastViewMatrix[12], lastViewMatrix[13], lastViewMatrix[14]]
-            : null;
-
          const fmt = n => (n >= 0 ? ' ' : '') + n.toFixed(2);
          const fmtVec = v => '[' + v.map(fmt).join(', ') + ']';
+         const sc = mandarinState.srcCorners;
 
          const lines = [
             'MR debug — PC master',
@@ -502,55 +497,21 @@ export const init = async model => {
             'pinyin:    ' + (mandarinState.pinyin   || '—'),
             'erased:    ' + mandarinState.erased,
             '',
-            'panelMatrix: ' + (M ? 'YES ✅' : 'no ❌'),
+            'srcCorners sent: ' + (sc ? 'YES ✅' : 'no ❌'),
+            'frameW × frameH: ' + mandarinState.frameW + ' × ' + mandarinState.frameH,
          ];
 
-         if (M && head) {
-            const half = SQUARE_SIZE / 2;
-            const tl = transform(M, [-half,  half, 0]);
-            const tr = transform(M, [ half,  half, 0]);
-            const br = transform(M, [ half, -half, 0]);
-            const bl = transform(M, [-half, -half, 0]);
-            const center = [M[12], M[13], M[14]];
-
-            // Canonical "is this in front of the head?" test, mirroring headGaze.js:
-            //   mm = viewMatrix(0) · worldCoords     (model→camera)
-            //   m  = mm · panelMatrix                (square in camera space)
-            //   m[14] < 0 → in front;  m[14] > 0 → behind
-            let placement = '?';
-            let camZ = null;
-            try {
-               const wc = (typeof window !== 'undefined' && window.worldCoords)
-                  ? window.worldCoords
-                  : [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
-               const view = clay.root().viewMatrix(0);
-               const mm = mxm(view, wc);
-               const mCam = mxm(mm, M);
-               camZ = mCam[14];
-               placement =
-                  camZ < -0.05 ? 'in FRONT of head ✅' :
-                  camZ >  0.05 ? 'BEHIND head ❌'      :
-                                 'at head depth ⚠';
-            } catch (e) {
-               placement = 'error: ' + e.message;
-            }
-
+         if (sc) {
             lines.push('');
-            lines.push('square center: ' + fmtVec(center));
-            lines.push('head position: ' + fmtVec(head));
-            lines.push('placement:     ' + placement);
-            if (camZ !== null) lines.push('cam-space z:   ' + fmt(camZ) + ' m');
-            lines.push('');
-            lines.push('TL: ' + fmtVec(tl));
-            lines.push('TR: ' + fmtVec(tr));
-            lines.push('BR: ' + fmtVec(br));
-            lines.push('BL: ' + fmtVec(bl));
+            lines.push('TL (img): ' + fmtVec(sc[0]));
+            lines.push('TR (img): ' + fmtVec(sc[1]));
+            lines.push('BR (img): ' + fmtVec(sc[2]));
+            lines.push('BL (img): ' + fmtVec(sc[3]));
          }
 
-         if (lastPoseLog && !lastPoseLog.ok) {
-            lines.push('');
-            lines.push('⚠ pose log: ' + JSON.stringify(lastPoseLog));
-         }
+         lines.push('');
+         lines.push('pose computed on: HEADSET');
+         lines.push('  (uses headset\'s own viewMatrix)');
 
          lines.push('');
          lines.push('last server result:');
