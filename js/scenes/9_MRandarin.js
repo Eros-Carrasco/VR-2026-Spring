@@ -2,6 +2,8 @@ import * as global from "../global.js";
 import { Gltf2Node } from "../render/nodes/gltf2.js";
 import { G2 } from "../util/g2.js";
 import { askAI } from "../util/aiquery.js";
+import { computeCameraPose } from "../util/computeCameraPose.js";
+import { mxm, transform } from "../util/matrix.js";
 
 window.mandarinState = {
    status:    'empty',
@@ -9,6 +11,7 @@ window.mandarinState = {
    pinyin:    null,
    meaning:   null,
    erased:    false,
+   panelMatrix: null,   // 16-float matrix: square→world (markers' plane in world space)
 };
 
 export const init = async model => {
@@ -27,6 +30,11 @@ export const init = async model => {
    const PANEL_SIZE     = 0.07;
    const PANEL_UP       = 0.6;
    const PANEL_RIGHT    = 0.6;
+
+   // ── Marker square pose constants (TUNE THESE) ─────────────────────────────
+   const SQUARE_FL     = 0.5;   // focal length in normalized image units; tweak if depth feels off
+   const SQUARE_SIZE   = 0.5;   // physical side of the marker square, in meters
+   const PANEL_SPREAD  = 1.0;   // 1.0 = panels exactly on marker corners; >1.0 pushes them outward
 
    let g2Debug = new G2();
    let frameCounter = 0;
@@ -190,11 +198,12 @@ export const init = async model => {
    // ── MASTER CLIENT (PC) ONLY ──────────────────────────────────────────────
    if (clientID == clients[0]) {
 
-      mandarinState.status    = 'empty';
-      mandarinState.character = null;
-      mandarinState.pinyin    = null;
-      mandarinState.meaning   = null;
-      mandarinState.erased    = false;
+      mandarinState.status      = 'empty';
+      mandarinState.character   = null;
+      mandarinState.pinyin      = null;
+      mandarinState.meaning     = null;
+      mandarinState.erased      = false;
+      mandarinState.panelMatrix = null;
 
       let canvas = document.createElement('canvas');
       let ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -244,6 +253,13 @@ export const init = async model => {
          if (isPolling) return;
          if (canvas.width <= 300 || canvas.height <= 150) return;
          isPolling = true;
+
+         // Snapshot the headset's view matrix at the moment we send the frame.
+         // Using lastViewMatrix (updated each animate tick) keeps capture and pose aligned.
+         const captureView = lastViewMatrix ? lastViewMatrix.slice() : null;
+         const frameW = canvas.width;
+         const frameH = canvas.height;
+
          try {
             const base64 = canvas.toDataURL('image/png').split(',')[1];
             const response = await fetch('http://localhost:1111/predict', {
@@ -259,12 +275,38 @@ export const init = async model => {
                mandarinState.pinyin    = result.pinyin;
                mandarinState.meaning   = result.meaning;
                mandarinState.erased    = false;
+
+               // ── Compute square→world pose from the 4 red markers ──────────
+               // result.src_corners is [TL, TR, BR, BL] in image coords, normalized 0..1
+               // (each axis divided by its own dimension — server line src_corners_norm).
+               // computeCameraPose expects 8 (u,v) values matching the model order
+               // S = [BL, BR, TR, TL] in math convention (y up).
+               // So we reorder TL/TR/BR/BL → BL/BR/TR/TL, center on 0, flip y, and
+               // correct for image aspect ratio (server normalizes x and y separately).
+               if (result.src_corners && captureView) {
+                  const src = result.src_corners;
+                  const reordered = [src[3], src[2], src[1], src[0]]; // → [BL, BR, TR, TL]
+                  const aspect = frameH / frameW;
+                  const C = [];
+                  for (const [u, v] of reordered) {
+                     C.push(u - 0.5);
+                     C.push(-(v - 0.5) * aspect);   // image y is down; flip + aspect-correct
+                  }
+                  const squareToCamera = computeCameraPose(C, SQUARE_FL, SQUARE_SIZE);
+                  // captureView is camera→world (inverseViewMatrix), so
+                  // square→world = captureView · square→camera
+                  mandarinState.panelMatrix = mxm(captureView, squareToCamera);
+               } else {
+                  console.warn('[MRandarin] no src_corners or captureView; panels will not appear');
+                  mandarinState.panelMatrix = null;
+               }
             } else if (result.erased === true) {
-               mandarinState.status    = 'empty';
-               mandarinState.character = null;
-               mandarinState.pinyin    = null;
-               mandarinState.meaning   = null;
-               mandarinState.erased    = true;
+               mandarinState.status      = 'empty';
+               mandarinState.character   = null;
+               mandarinState.pinyin      = null;
+               mandarinState.meaning     = null;
+               mandarinState.erased      = true;
+               mandarinState.panelMatrix = null;
             }
             // else: server is locked — no change
          } catch (err) {
@@ -280,12 +322,22 @@ export const init = async model => {
    // ── ALL CLIENTS ───────────────────────────────────────────────────────────
    let lastCharacter = undefined;
    let lastFetchedMeaning = null;
+   let lastViewMatrix = null;   // refreshed every animate tick; read by pollServer
 
    model.animate(() => {
       mandarinState = server.synchronize('mandarinState');
       if (clientID == clients[0]) {
          server.broadcastGlobal('mandarinState');
       }
+
+      // Keep the latest view matrix around so pollServer can snapshot it.
+      const _inv = clay.root().inverseViewMatrix(0);
+      lastViewMatrix = [
+         _inv[0],  _inv[1],  _inv[2],  _inv[3],
+         _inv[4],  _inv[5],  _inv[6],  _inv[7],
+         _inv[8],  _inv[9],  _inv[10], _inv[11],
+         _inv[12], _inv[13], _inv[14], _inv[15],
+      ];
 
       const shouldClear = mandarinState.status === 'empty' && displayChar !== null;
 
@@ -330,31 +382,44 @@ export const init = async model => {
          g2Debug.update();
       }
 
-      {
-         const inv     = clay.root().inverseViewMatrix(0);
-         const headPos = [inv[12], inv[13], inv[14]];
-         const right   = [inv[0],  inv[1],  inv[2]];
-         const up      = [inv[4],  inv[5],  inv[6]];
-         const forward = [-inv[8], -inv[9], -inv[10]];
+      // ── Place the 4 info panels in the world, anchored to the marker square ──
+      // No marker pose yet (or character cleared) → hide all four panels.
+      const M = mandarinState.panelMatrix;
+      if (M && displayChar) {
+         // The marker square lives in its own plane: x=right, y=up, z=normal.
+         // Extract those axes from M (which is square→world).
+         const rx = [M[0], M[1], M[2]];   // right axis of the square, in world space
+         const uy = [M[4], M[5], M[6]];   // up axis of the square, in world space
+         const nz = [M[8], M[9], M[10]];  // normal of the square (out of the wall)
 
-         function placePanel(panel, rx, uy) {
-            const p = [
-               headPos[0] + forward[0] * PANEL_DISTANCE + up[0] * uy + right[0] * rx,
-               headPos[1] + forward[1] * PANEL_DISTANCE + up[1] * uy + right[1] * rx,
-               headPos[2] + forward[2] * PANEL_DISTANCE + up[2] * uy + right[2] * rx,
-            ];
+         // Four corners of the model square at (±s/2, ±s/2, 0), then scaled by spread,
+         // mapped to world via M.
+         const half = (SQUARE_SIZE / 2) * PANEL_SPREAD;
+         const cornerTL = transform(M, [-half,  half, 0]);
+         const cornerTR = transform(M, [ half,  half, 0]);
+         const cornerBL = transform(M, [-half, -half, 0]);
+         const cornerBR = transform(M, [ half, -half, 0]);
+
+         function placePanelAt(panel, pos) {
             panel.setMatrix([
-               right[0] * PANEL_SIZE,  right[1] * PANEL_SIZE,  right[2] * PANEL_SIZE,  0,
-               up[0]    * PANEL_SIZE,  up[1]    * PANEL_SIZE,  up[2]    * PANEL_SIZE,  0,
-               -forward[0],           -forward[1],            -forward[2],            0,
-               p[0], p[1], p[2], 1,
+               rx[0] * PANEL_SIZE, rx[1] * PANEL_SIZE, rx[2] * PANEL_SIZE, 0,
+               uy[0] * PANEL_SIZE, uy[1] * PANEL_SIZE, uy[2] * PANEL_SIZE, 0,
+               nz[0],              nz[1],              nz[2],              0,
+               pos[0],             pos[1],             pos[2],             1,
             ]);
          }
 
-         placePanel(panelChar,   -PANEL_RIGHT,  PANEL_UP);
-         placePanel(panelPinyin,  PANEL_RIGHT,  PANEL_UP);
-         placePanel(panelImage,  -PANEL_RIGHT, -PANEL_UP);
-         placePanel(panelAI,      PANEL_RIGHT, -PANEL_UP);
+         placePanelAt(panelChar,   cornerTL);
+         placePanelAt(panelPinyin, cornerTR);
+         placePanelAt(panelImage,  cornerBL);
+         placePanelAt(panelAI,     cornerBR);
+      } else {
+         // Push panels far out of sight when there's nothing to show.
+         const hidden = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,-999,0,1];
+         panelChar  .setMatrix(hidden);
+         panelPinyin.setMatrix(hidden);
+         panelImage .setMatrix(hidden);
+         panelAI    .setMatrix(hidden);
       }
 
       g2Char.update();
