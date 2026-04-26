@@ -65,6 +65,11 @@ export const init = async model => {
    let displayImage = null;
    let displayAI = null;
 
+   // ── PC-only debug overlay (created later if we are master) ────────────────
+   let debugDiv = null;                  // HTML <div> shown on the PC window
+   let lastServerResult = null;          // last raw response from /predict
+   let lastPoseLog = null;               // last pose-computation summary
+
    // ── G2 render functions ───────────────────────────────────────────────────
    g2Char.render = function () {
       this.setColor([0.05, 0.05, 0.05, 0.92]);
@@ -182,7 +187,7 @@ export const init = async model => {
       }
 
       try {
-         const prompt = `In 6 words or less, give one factual and memorable sentence about "${wikiTerm}". No metaphors, just a clear memorable fact.`;
+         const prompt = `In 10 words or less, give one factual and memorable sentence about "${wikiTerm}". No metaphors, just a clear memorable fact.`;
          displayAI = await askAI(prompt);
       } catch (e) {
          console.warn('AI fetch failed:', e);
@@ -226,6 +231,28 @@ export const init = async model => {
       btn.style.cssText = 'position:fixed;bottom:10px;left:10px;z-index:99999;padding:10px 20px;font-size:16px;cursor:pointer;';
       document.body.appendChild(btn);
 
+      // ── PC debug overlay ───────────────────────────────────────────────────
+      debugDiv = document.createElement('div');
+      debugDiv.style.cssText = `
+         position: fixed;
+         top: 10px;
+         right: 10px;
+         width: 380px;
+         padding: 12px 14px;
+         background: rgba(0, 0, 0, 0.85);
+         color: #ddd;
+         font-family: 'Courier New', monospace;
+         font-size: 12px;
+         line-height: 1.45;
+         z-index: 99999;
+         border: 1px solid #555;
+         white-space: pre;
+         pointer-events: none;
+         border-radius: 4px;
+      `;
+      debugDiv.textContent = 'MR debug — waiting for first server reply…';
+      document.body.appendChild(debugDiv);
+
       btn.addEventListener('click', async () => {
          btn.disabled = true;
          btn.innerText = 'Capturing...';
@@ -268,6 +295,7 @@ export const init = async model => {
                body: JSON.stringify({ image: base64 })
             });
             const result = await response.json();
+            lastServerResult = result;
             console.log('[MRandarin] server result:', JSON.stringify(result));
             if (result.character) {
                mandarinState.status    = 'drawn';
@@ -295,10 +323,25 @@ export const init = async model => {
                   const squareToCamera = computeCameraPose(C, SQUARE_FL, SQUARE_SIZE);
                   // captureView is camera→world (inverseViewMatrix), so
                   // square→world = captureView · square→camera
-                  mandarinState.panelMatrix = mxm(captureView, squareToCamera);
+                  const M = mxm(captureView, squareToCamera);
+                  const hasNaN = M.some(n => !isFinite(n));
+                  mandarinState.panelMatrix = hasNaN ? null : M;
+
+                  lastPoseLog = {
+                     ok:        !hasNaN,
+                     character: result.character,
+                     center:    [M[12], M[13], M[14]],
+                     headPos:   [captureView[12], captureView[13], captureView[14]],
+                     hasNaN,
+                  };
+                  console.log('[MRandarin] pose computed:', lastPoseLog);
                } else {
                   console.warn('[MRandarin] no src_corners or captureView; panels will not appear');
                   mandarinState.panelMatrix = null;
+                  lastPoseLog = {
+                     ok: false,
+                     reason: !result.src_corners ? 'no src_corners in result' : 'no captureView',
+                  };
                }
             } else if (result.erased === true) {
                mandarinState.status      = 'empty';
@@ -307,6 +350,7 @@ export const init = async model => {
                mandarinState.meaning     = null;
                mandarinState.erased      = true;
                mandarinState.panelMatrix = null;
+               lastPoseLog = null;
             }
             // else: server is locked — no change
          } catch (err) {
@@ -426,5 +470,63 @@ export const init = async model => {
       g2Pinyin.update();
       g2Image.update();
       g2AI.update();
+
+      // ── PC debug overlay update ───────────────────────────────────────────
+      if (debugDiv) {
+         const M = mandarinState.panelMatrix;
+         const head = lastViewMatrix
+            ? [lastViewMatrix[12], lastViewMatrix[13], lastViewMatrix[14]]
+            : null;
+
+         const fmt = n => (n >= 0 ? ' ' : '') + n.toFixed(2);
+         const fmtVec = v => '[' + v.map(fmt).join(', ') + ']';
+
+         const lines = [
+            'MR debug — PC master',
+            '─────────────────────────',
+            'status:    ' + (mandarinState.status || '—'),
+            'character: ' + (mandarinState.character || '—'),
+            'pinyin:    ' + (mandarinState.pinyin   || '—'),
+            'erased:    ' + mandarinState.erased,
+            '',
+            'panelMatrix: ' + (M ? 'YES ✅' : 'no ❌'),
+         ];
+
+         if (M && head) {
+            const half = SQUARE_SIZE / 2;
+            const tl = transform(M, [-half,  half, 0]);
+            const tr = transform(M, [ half,  half, 0]);
+            const br = transform(M, [ half, -half, 0]);
+            const bl = transform(M, [-half, -half, 0]);
+            const center = [M[12], M[13], M[14]];
+            const dx = center[0] - head[0];
+            const dy = center[1] - head[1];
+            const dz = center[2] - head[2];
+            const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+            lines.push('');
+            lines.push('square center: ' + fmtVec(center));
+            lines.push('head position: ' + fmtVec(head));
+            lines.push('dist head→sq: ' + fmt(dist) + ' m');
+            lines.push('');
+            lines.push('TL: ' + fmtVec(tl));
+            lines.push('TR: ' + fmtVec(tr));
+            lines.push('BR: ' + fmtVec(br));
+            lines.push('BL: ' + fmtVec(bl));
+         }
+
+         if (lastPoseLog && !lastPoseLog.ok) {
+            lines.push('');
+            lines.push('⚠ pose log: ' + JSON.stringify(lastPoseLog));
+         }
+
+         lines.push('');
+         lines.push('last server result:');
+         lines.push(lastServerResult
+            ? JSON.stringify(lastServerResult).slice(0, 200)
+            : '— none yet —');
+
+         debugDiv.textContent = lines.join('\n');
+      }
    });
 };
