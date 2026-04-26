@@ -182,7 +182,7 @@ export const init = async model => {
       }
 
       try {
-         const prompt = `In 10 words or less, give one factual and memorable sentence about "${wikiTerm}". No metaphors, just a clear memorable fact.`;
+         const prompt = `In 6 words or less, give one factual and memorable sentence about "${wikiTerm}". No metaphors, just a clear memorable fact.`;
          displayAI = await askAI(prompt);
       } catch (e) {
          console.warn('AI fetch failed:', e);
