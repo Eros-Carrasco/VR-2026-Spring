@@ -320,10 +320,23 @@ export const init = async model => {
                      C.push(u - 0.5);
                      C.push(-(v - 0.5) * aspect);   // image y is down; flip + aspect-correct
                   }
-                  const squareToCamera = computeCameraPose(C, SQUARE_FL, SQUARE_SIZE);
+                  const squareToCameraCV = computeCameraPose(C, SQUARE_FL, SQUARE_SIZE);
+                  // computeCameraPose returns the pose in CV convention (camera looks
+                  // toward +z). The framework / WebXR uses GL convention (camera looks
+                  // toward -z). Flip the z column to convert between them.
+                  const flipZ = [1,0,0,0,  0,1,0,0,  0,0,-1,0,  0,0,0,1];
+                  const squareToCamera = mxm(flipZ, squareToCameraCV);
                   // captureView is camera→world (inverseViewMatrix), so
                   // square→world = captureView · square→camera
-                  const M = mxm(captureView, squareToCamera);
+                  const M_world = mxm(captureView, squareToCamera);
+                  // Convert world space (system A) → model space (system B), where
+                  // model nodes live. When worldCoords = identity these are the same;
+                  // when the user has pinched to move the world, this keeps the panels
+                  // anchored correctly.
+                  const inverseWC = (typeof clay !== 'undefined' && clay.inverseRootMatrix)
+                     ? clay.inverseRootMatrix
+                     : [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+                  const M = mxm(inverseWC, M_world);
                   const hasNaN = M.some(n => !isFinite(n));
                   mandarinState.panelMatrix = hasNaN ? null : M;
 
@@ -499,15 +512,34 @@ export const init = async model => {
             const br = transform(M, [ half, -half, 0]);
             const bl = transform(M, [-half, -half, 0]);
             const center = [M[12], M[13], M[14]];
-            const dx = center[0] - head[0];
-            const dy = center[1] - head[1];
-            const dz = center[2] - head[2];
-            const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+            // Canonical "is this in front of the head?" test, mirroring headGaze.js:
+            //   mm = viewMatrix(0) · worldCoords     (model→camera)
+            //   m  = mm · panelMatrix                (square in camera space)
+            //   m[14] < 0 → in front;  m[14] > 0 → behind
+            let placement = '?';
+            let camZ = null;
+            try {
+               const wc = (typeof window !== 'undefined' && window.worldCoords)
+                  ? window.worldCoords
+                  : [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+               const view = clay.root().viewMatrix(0);
+               const mm = mxm(view, wc);
+               const mCam = mxm(mm, M);
+               camZ = mCam[14];
+               placement =
+                  camZ < -0.05 ? 'in FRONT of head ✅' :
+                  camZ >  0.05 ? 'BEHIND head ❌'      :
+                                 'at head depth ⚠';
+            } catch (e) {
+               placement = 'error: ' + e.message;
+            }
 
             lines.push('');
             lines.push('square center: ' + fmtVec(center));
             lines.push('head position: ' + fmtVec(head));
-            lines.push('dist head→sq: ' + fmt(dist) + ' m');
+            lines.push('placement:     ' + placement);
+            if (camZ !== null) lines.push('cam-space z:   ' + fmt(camZ) + ' m');
             lines.push('');
             lines.push('TL: ' + fmtVec(tl));
             lines.push('TR: ' + fmtVec(tr));
