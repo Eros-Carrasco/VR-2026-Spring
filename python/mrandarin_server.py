@@ -162,7 +162,8 @@ def run_vision_ocr(image_bytes):
 
     req = Vision.VNRecognizeTextRequest.alloc().initWithCompletionHandler_(handler)
     req.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
-    req.setRecognitionLanguages_(['zh-Hans', 'zh-Hant'])
+    req.setRecognitionLanguages_(['zh-Hans'])
+    # req.setRecognitionLanguages_(['zh-Hans', 'zh-Hant']) Hans is simplified, Hant is traditional. For now I'll focus on simplified.
     req.setUsesLanguageCorrection_(False)
 
     handler_obj = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(
