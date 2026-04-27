@@ -17,6 +17,7 @@ window.mandarinState = {
    frameW: 0,
    frameH: 0,
    resetCounter: 0,   // bumped by the PC's reset key; all clients clear local zone state in response
+   lockCounter:  0,   // bumped by the headset's controller button; captures activeZone & switches backend to TRACKING_ARUCO
 };
 
 export const init = async model => {
@@ -40,7 +41,7 @@ export const init = async model => {
    const SQUARE_FL = 0.5;   // focal length in normalized image units; tweak if depth feels off
    const SQUARE_SIZE = 0.5;   // physical side of the marker square, in meters
    const PANEL_SPREAD = 1.0;   // 1.0 = panels exactly on marker corners; >1.0 pushes them outward
-   const ARUCO_SIZE = 0.08;  // physical side of each ArUco hologram, in meters (TUNE)
+   const ARUCO_SIZE = 0.03;  // physical side of each ArUco hologram, in meters (TUNE)
 
    let g2Debug = new G2();
    let frameCounter = 0;
@@ -227,6 +228,19 @@ export const init = async model => {
       lastFetchedMeaning = null;
    }
 
+   // ── Manual lock trigger (headset controller button) ───────────────────────
+   // Fires on whichever client receives the input — typically the headset,
+   // since that's where the controllers are. Bumps lockCounter and broadcasts
+   // so the PC Master can pick it up via synchronize at the top of animate.
+   // The PC also broadcasts mandarinState every frame, but the headset does
+   // NOT — so this explicit broadcast is essential for headset-originated
+   // state changes to ever reach the server.
+   inputEvents.onPress = hand => {
+      mandarinState.lockCounter = (mandarinState.lockCounter || 0) + 1;
+      server.broadcastGlobal('mandarinState');
+      console.log('[MRandarin] lock pressed (' + hand + ')');
+   };
+
    // ── MASTER CLIENT (PC) ONLY ──────────────────────────────────────────────
    if (clientID == clients[0]) {
 
@@ -390,6 +404,7 @@ export const init = async model => {
    let localPanelMatrix = null;        // computed locally on this client (uses LOCAL viewMatrix)
    let activeZone = null;        // captured ONCE on first valid srcCorners; persists through erase
    let lastResetCounter = 0;           // tracks mandarinState.resetCounter to detect resets across clients
+   let lastLockCounter  = 0;           // tracks mandarinState.lockCounter to detect manual lock presses across clients
 
    // Build a square→model-space pose from the four image-space corners returned
    // by the server. Uses THIS client's current inverseViewMatrix(0), so when run
@@ -465,16 +480,32 @@ export const init = async model => {
          hidePanels();
       }
 
-      // ── Capture the marker zone ONCE on first valid srcCorners ────────────
-      // Once captured, activeZone remains valid through erase/relock cycles —
-      // only a /reset (R key) clears it. The 4 ArUco panels below anchor to
-      // this saved pose so they keep projecting over the physical dots even
-      // when no character is currently recognized.
-      if (!activeZone && mandarinState.srcCorners
-         && mandarinState.frameW && mandarinState.frameH) {
-         activeZone = computeLocalPanelMatrix(
-            mandarinState.srcCorners, mandarinState.frameW, mandarinState.frameH
-         );
+      // ── Lock signal — capture activeZone (all clients) + switch backend (PC only) ──
+      // Bulletproof gate against spurious triggers on page load:
+      //   1. Strict monotonic check (>) — only ADVANCING the counter triggers,
+      //      never going backward or syncing a stale value from the server.
+      //   2. lastLockCounter is claimed FIRST, before any work, so even if we
+      //      bail out below we never re-enter on the same value.
+      //   3. activeZone capture AND the /lock fetch are BOTH gated on
+      //      srcCorners — without it we'd be telling the backend to track
+      //      ArUcos that haven't been rendered yet (the bug that caused the
+      //      "Markers not found" spam loop on page load).
+      const currentLock = mandarinState.lockCounter || 0;
+      if (currentLock > lastLockCounter) {
+         lastLockCounter = currentLock;   // claim it IMMEDIATELY
+         if (mandarinState.srcCorners && mandarinState.frameW && mandarinState.frameH) {
+            activeZone = computeLocalPanelMatrix(
+               mandarinState.srcCorners, mandarinState.frameW, mandarinState.frameH
+            );
+            console.log('[MRandarin] zone locked');
+            // PC Master only — and only after we know srcCorners is real.
+            if (clientID == clients[0]) {
+               fetch('http://localhost:1111/lock', { method: 'POST' })
+                  .catch(err => console.warn('[MRandarin] /lock failed:', err));
+            }
+         } else {
+            console.warn('[MRandarin] lock pressed but no srcCorners available — point camera at the 4 red dots first, then press again');
+         }
       }
 
       const shouldClear = mandarinState.status === 'empty' && displayChar !== null;
@@ -593,6 +624,10 @@ export const init = async model => {
             '',
             'srcCorners sent: ' + (sc ? 'YES ✅' : 'no ❌'),
             'frameW × frameH: ' + mandarinState.frameW + ' × ' + mandarinState.frameH,
+            '',
+            'lockCounter:  ' + (mandarinState.lockCounter  || 0),
+            'resetCounter: ' + (mandarinState.resetCounter || 0),
+            'activeZone:   ' + (activeZone ? 'YES ✅' : 'no ❌'),
          ];
 
          if (sc) {

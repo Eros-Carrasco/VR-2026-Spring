@@ -29,10 +29,12 @@ CORS(app)
 # Suppress Flask's per-request access log — only show errors
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-# State machine: 'SEARCHING_RED' uses HSV red-dot detection (used once at
-# startup or after /reset); 'TRACKING_ARUCO' uses ArUco IDs 0-3 (used after
-# the workspace is locked, so hand occlusion of the physical dots stops
-# breaking the quad — the headset's holograms render on top of the hand).
+# State machine: 'SEARCHING_RED' uses HSV red-dot detection (default at
+# startup and after /reset); 'TRACKING_ARUCO' uses ArUco IDs 0-3 (entered
+# only when the frontend POSTs /lock — i.e. the user manually anchors via
+# the controller button). Hand occlusion of the physical dots stops breaking
+# the quad once locked, because the headset's holograms render on top of the
+# hand in the cast.
 _state = 'SEARCHING_RED'
 
 # Debug state shared between /predict and /debug
@@ -70,19 +72,15 @@ def predict():
         # --- Detect zone using the active detector (red dots OR ArUco) ───────
         # Same downstream logic regardless of which detector ran: order_corners
         # will spatially sort the 4 centroids into [TL, TR, BR, BL].
+        # NOTE: The state transition SEARCHING_RED → TRACKING_ARUCO is no
+        # longer automatic. It only happens via POST /lock (frontend triggers
+        # this when the user presses the controller button). This guarantees
+        # the user gets to choose the anchoring moment / camera angle.
         if _state == 'SEARCHING_RED':
             centroids = detect_markers(bgr)
         else:  # TRACKING_ARUCO
             centroids = detect_aruco(bgr)
         valid_quad = len(centroids) == 4 and is_valid_quad(centroids)
-
-        # State transition: first valid red-dot quad locks the workspace.
-        # From here on, ArUco holograms (rendered by the headset over the dots)
-        # do the tracking — hand occlusion of the physical dots no longer breaks
-        # the quad, because the holograms render on top of the hand in the cast.
-        if _state == 'SEARCHING_RED' and valid_quad:
-            _state = 'TRACKING_ARUCO'
-            print('[state] SEARCHING_RED → TRACKING_ARUCO (workspace locked)')
 
         # --- Lock-on: skip OCR while a character is locked, check for erase instead ---
         if _debug_state['locked']:
@@ -285,12 +283,29 @@ def debug():
 </html>"""
     return html, 200, {'Content-Type': 'text/html; charset=utf-8'}
 
+@app.route('/lock', methods=['POST'])
+def lock():
+    """Manually switch the server to TRACKING_ARUCO.
+
+    Called by the frontend's PC Master when the user presses the controller
+    button (onPress on the headset → broadcast → PC Master fetches this).
+    After this returns, /predict will use detect_aruco instead of
+    detect_markers — immune to physical hand occlusion of the red dots,
+    because the headset's ArUco holograms render on top of the hand in the
+    cast.
+    """
+    global _state
+    _state = 'TRACKING_ARUCO'
+    print('[state] LOCK → TRACKING_ARUCO (manual lock from controller)')
+    return jsonify({'status': 'locked', 'state': _state})
+
 @app.route('/reset', methods=['POST'])
 def reset():
     """Revert the server to SEARCHING_RED and clear all per-session state.
 
-    Called by the frontend's R key. After this returns, the next /predict that
-    sees a valid red-dot quad will lock the zone and switch back to ArUco mode.
+    Called by the frontend's R key. After this returns, the next /predict
+    will run detect_markers (red dots) again. The next /lock POST will then
+    re-anchor with the new corners.
     """
     global _state
     _state = 'SEARCHING_RED'
