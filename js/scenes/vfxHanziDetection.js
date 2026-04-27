@@ -12,11 +12,11 @@ export const init = async model => {
    // Fase 1: Chispas       → 0.0s a 0.3s
    // Fase 2: Líneas        → 0.3s a 0.7s
    // Fase 3: Paneles       → 0.7s a 1.1s
-   const T_SPARK_DUR    = 0.3;
+   const T_SPARK_DUR    = 0.6;
    const T_LINE_START   = T_SPARK_DUR;                 // 0.3 — empiezan cuando terminan las chispas
-   const T_LINE_DUR     = 0.4;
+   const T_LINE_DUR     = 0.6;
    const T_PANEL_START  = T_LINE_START + T_LINE_DUR;   // 0.7 — empiezan cuando terminan las líneas
-   const T_PANEL_DUR    = 0.4;
+   const T_PANEL_DUR    = 0.6;
 
    let isShowing       = false;
    let appearStartTime = 9999.0;
@@ -74,7 +74,7 @@ export const init = async model => {
       }
 
       // 2. LÍNEAS EN CRUZ (Nacen del borde del CENTRAL_SIZE) — sólo durante su fase
-      if (t >= T_LINE_START && t <= T_PANEL_START + 0.05) {
+      if (t >= T_LINE_START) {
          let lp = Math.min(1, (t - T_LINE_START) / T_LINE_DUR);
          this.setColor([0.0, 1.0, 0.9, 0.8]);
          this.lineWidth(0.015);
