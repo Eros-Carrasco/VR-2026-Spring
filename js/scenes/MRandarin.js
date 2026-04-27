@@ -18,6 +18,14 @@ window.mandarinState = {
    frameH: 0,
    resetCounter: 0,   // bumped by the PC's reset key; all clients clear local zone state in response
    lockCounter:  0,   // bumped by the headset's controller button; captures activeZone & switches backend to TRACKING_ARUCO
+   // Bbox of the detected character WITHIN the 800×800 zone, normalized [0..1].
+   // char_x_pct/char_y_pct = bbox center; bbox_w_pct/bbox_h_pct = bbox size.
+   // Used to anchor the hanzi VFX (sparks, lines, info panels) to the actual
+   // character location on the surface, not to the zone's geometric center.
+   char_x_pct: null,
+   char_y_pct: null,
+   bbox_w_pct: null,
+   bbox_h_pct: null,
 };
 
 export const init = async model => {
@@ -31,99 +39,194 @@ export const init = async model => {
    const DEBUG_HUD_RIGHT = 0.45;
    const DEBUG_HUD_SIZE = 0.08;
 
-   // ── Panel layout constants ────────────────────────────────────────────────
-   const PANEL_DISTANCE = 1.5;
-   const PANEL_SIZE = 0.07;
-   const PANEL_UP = 0.6;
-   const PANEL_RIGHT = 0.6;
-
    // ── Marker square pose constants (TUNE THESE) ─────────────────────────────
-   const SQUARE_FL = 0.5;   // focal length in normalized image units; tweak if depth feels off
-   const SQUARE_SIZE = 0.5;   // physical side of the marker square, in meters
+   const SQUARE_FL    = 0.5;   // focal length in normalized image units; tweak if depth feels off
+   const SQUARE_SIZE  = 0.5;   // physical side of the marker square, in meters
    const PANEL_SPREAD = 1.0;   // 1.0 = panels exactly on marker corners; >1.0 pushes them outward
-   const ARUCO_SIZE = 0.03;  // physical side of each ArUco hologram, in meters (TUNE)
+   const ARUCO_SIZE   = 0.02;  // physical side of each ArUco hologram, in meters (TUNE)
 
-   let g2Debug = new G2();
+   // ── Hanzi VFX constants (TUNE THESE) ──────────────────────────────────────
+   const HANZI_LINE_LEN  = 0.04;  // meters — length of cardinal lines from bbox edge to panel
+   const HANZI_PANEL_MUL = 1.5;   // panel side = HANZI_PANEL_MUL × max(bbox_w, bbox_h)
+
+   // ── VFX choreography (seconds, relative to event start) ───────────────────
+   // Hanzi event (fires when a new character is detected):
+   //   0.0 - 0.6   sparks fly outward from bbox center
+   //   0.6 - 1.2   cardinal lines extend from bbox edges
+   //   1.2 - 1.8   info panels grow + fade in
+   const T_SPARK_DUR   = 0.6;
+   const T_LINE_START  = T_SPARK_DUR;                   // 0.6
+   const T_LINE_DUR    = 0.6;
+   const T_PANEL_START = T_LINE_START + T_LINE_DUR;     // 1.2
+   const T_PANEL_DUR   = 0.6;
+   // Surface event (fires when lockCounter advances):
+   //   0.0 - 1.5   LIDAR-style scan across the zone, then fades
+   //   perimeter persists indefinitely after that
+   const T_SURFACE_SCAN = 1.5;
+
    let frameCounter = 0;
 
-   // ── Four G2 panels ────────────────────────────────────────────────────────
-   let g2Char = new G2();
-   let g2Pinyin = new G2();
-   let g2Image = new G2();
-   let g2AI = new G2();
+   // ── G2 canvases for VFX (coplanar with the zone) ──────────────────────────
+   let g2Surface = new G2();   // LIDAR scan + persistent perimeter
+   let g2HanziFX = new G2();   // sparks + cardinal lines
 
-   // ── ArUco marker textures (slots 0-3) ─────────────────────────────────────
-   // Persisted as holograms over the 4 physical red dots so OpenCV can keep
-   // tracking the workspace in the cast even when the user's hand occludes
-   // the dots underneath. Mapping: 0=TL, 1=TR, 2=BR, 3=BL.
+   // ── G2 canvases for info panels ───────────────────────────────────────────
+   let g2Char    = new G2();
+   let g2Pinyin  = new G2();
+   let g2Meaning = new G2();
+   let g2Image   = new G2();
+   let g2AI      = new G2();
+   let g2Debug   = new G2();
+
+   // ── Texture slot assignments ──────────────────────────────────────────────
+   // 0-3 = ArUco PNGs (TL, TR, BR, BL)
+   // 4   = panelChar (currently hidden, kept for future use)
+   // 5   = panelPinyin
+   // 6   = panelImage
+   // 7   = panelAI
+   // 8   = panelDebug
+   // 9   = g2Surface (LIDAR + perimeter)
+   // 10  = g2HanziFX (sparks + lines)
+   // 11  = panelMeaning
    model.txtrSrc(0, '../media/mrandarin/ArUco_0.png');
    model.txtrSrc(1, '../media/mrandarin/ArUco_1.png');
    model.txtrSrc(2, '../media/mrandarin/ArUco_2.png');
    model.txtrSrc(3, '../media/mrandarin/ArUco_3.png');
+   model.txtrSrc(4,  g2Char.getCanvas());
+   model.txtrSrc(5,  g2Pinyin.getCanvas());
+   model.txtrSrc(6,  g2Image.getCanvas());
+   model.txtrSrc(7,  g2AI.getCanvas());
+   model.txtrSrc(8,  g2Debug.getCanvas());
+   model.txtrSrc(9,  g2Surface.getCanvas());
+   model.txtrSrc(10, g2HanziFX.getCanvas());
+   model.txtrSrc(11, g2Meaning.getCanvas());
 
-   model.txtrSrc(4, g2Char.getCanvas());
-   model.txtrSrc(5, g2Pinyin.getCanvas());
-   model.txtrSrc(6, g2Image.getCanvas());
-   model.txtrSrc(7, g2AI.getCanvas());
-   model.txtrSrc(8, g2Debug.getCanvas());
+   // ── Render order matters: later .add() calls draw ON TOP of earlier ones ──
+   // Stack (bottom → top):
+   //   1. Surface VFX & Hanzi VFX (coplanar with the workspace)
+   //   2. Info panels (above the VFX, below the ArUco holograms)
+   //   3. ArUco holograms (always on top — they're the OpenCV tracking targets,
+   //      they MUST remain visible to the headset's casted view at all times,
+   //      especially during the VFX animation)
 
-   let panelChar = model.add('square').txtr(4).dull();
-   let panelPinyin = model.add('square').txtr(5).dull();
-   let panelImage = model.add('square').txtr(6).dull();
-   let panelAI = model.add('square').txtr(7).dull();
-   let panelDebug = model.add('square').txtr(8).scale(DEBUG_HUD_SIZE).dull();
+   // 1. VFX layers (deepest)
+   let surfaceObj = model.add('square').txtr(9).dull();
+   let hanziFXObj = model.add('square').txtr(10).dull();
+
+   // 2. Info panels
+   let panelChar    = model.add('square').txtr(4).dull();
+   let panelPinyin  = model.add('square').txtr(5).dull();
+   let panelImage   = model.add('square').txtr(6).dull();
+   let panelAI      = model.add('square').txtr(7).dull();
+   let panelMeaning = model.add('square').txtr(11).dull();
+   let panelDebug   = model.add('square').txtr(8).scale(DEBUG_HUD_SIZE).dull();
    if (!DEBUG_HUD) panelDebug.move(0, -999, 0);
 
-   // ── ArUco hologram panels (TL, TR, BR, BL) ────────────────────────────────
-   // These persist across erase/relock cycles. They get positioned the first
-   // time mandarinState.srcCorners is valid and stay there until /reset.
+   // 3. ArUco holograms (topmost — render last)
    let arucoTL = model.add('square').txtr(0).dull();
    let arucoTR = model.add('square').txtr(1).dull();
    let arucoBR = model.add('square').txtr(2).dull();
    let arucoBL = model.add('square').txtr(3).dull();
-   // Hide off-screen until first zone capture.
-   arucoTL.move(0, -999, 0);
-   arucoTR.move(0, -999, 0);
-   arucoBR.move(0, -999, 0);
-   arucoBL.move(0, -999, 0);
+
+   // Hide everything off-screen until first zone capture / character detection.
+   const HIDDEN_MATRIX = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, -999, 0, 1];
+   surfaceObj.setMatrix(HIDDEN_MATRIX);
+   hanziFXObj.setMatrix(HIDDEN_MATRIX);
+   panelChar.setMatrix(HIDDEN_MATRIX);     // permanently hidden for now (per spec)
+   panelPinyin.setMatrix(HIDDEN_MATRIX);
+   panelImage.setMatrix(HIDDEN_MATRIX);
+   panelAI.setMatrix(HIDDEN_MATRIX);
+   panelMeaning.setMatrix(HIDDEN_MATRIX);
+   arucoTL.setMatrix(HIDDEN_MATRIX);
+   arucoTR.setMatrix(HIDDEN_MATRIX);
+   arucoBR.setMatrix(HIDDEN_MATRIX);
+   arucoBL.setMatrix(HIDDEN_MATRIX);
 
    // ── Display state ─────────────────────────────────────────────────────────
-   let displayChar = null;
-   let displayPinyin = null;
+   let displayChar    = null;
+   let displayPinyin  = null;
    let displayMeaning = null;
-   let displayImage = null;
-   let displayAI = null;
+   let displayImage   = null;
+   let displayAI      = null;
+
+   // ── VFX state ─────────────────────────────────────────────────────────────
+   let surfaceActive   = false;     // becomes true on first lock; stays true (perimeter persists)
+   let surfaceStartTime = 9999.0;   // model.time when last lock fired (re-triggered each lock)
+   let hanziActive     = false;     // true while a character is being shown
+   let hanziStartTime  = 9999.0;    // model.time when current character first appeared
 
    // ── PC-only debug overlay (created later if we are master) ────────────────
-   let debugDiv = null;                  // HTML <div> shown on the PC window
-   let lastServerResult = null;          // last raw response from /predict
+   let debugDiv = null;             // HTML <div> shown on the PC window
+   let lastServerResult = null;     // last raw response from /predict
 
-   // ── G2 render functions ───────────────────────────────────────────────────
+   // ─────────────────────────────────────────────────────────────────────────
+   // INFO PANEL RENDERS
+   // ─────────────────────────────────────────────────────────────────────────
+   // The panels share a common style: dark blue-tinted bg + cyan border + content.
+   // panelMeaning and panelPinyin also get small uppercase titles; panelImage
+   // and panelAI just show their content.
+   // The `alpha` driver is the panel-progress eased value, so the panels fade
+   // in alongside their grow animation (T_PANEL_START..T_PANEL_DUR).
+
+   function panelAlpha() {
+      if (!hanziActive) return 0;
+      const t = model.time - hanziStartTime;
+      const pp = Math.max(0, Math.min(1, (t - T_PANEL_START) / T_PANEL_DUR));
+      return pp;
+   }
+
+   function drawPanelChrome(g2, alpha) {
+      const ctx = g2.getContext(), canvas = g2.getCanvas();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (alpha <= 0) return false;
+      // Background
+      g2.setColor([0.02, 0.05, 0.1, 0.85 * alpha]);
+      g2.fillRect(-1, -1, 2, 2);
+      // Border
+      g2.setColor([0.0, 1.0, 0.9, 0.5 * alpha]);
+      g2.lineWidth(0.04);
+      g2.drawPath([[-1, -1], [1, -1], [1, 1], [-1, 1], [-1, -1]]);
+      return true;
+   }
+
    g2Char.render = function () {
-      this.setColor([0.05, 0.05, 0.05, 0.92]);
-      this.fillRect(-1, -1, 2, 2);
-      if (!displayChar) return;
-      this.setColor([1, 1, 1, 1]);
-      this.textHeight(0.65);
-      this.text(displayChar, 0, 0.05, 'center');
+      // Hidden by spec for now — never drawn.
+      const ctx = this.getContext(), canvas = this.getCanvas();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
    };
 
    g2Pinyin.render = function () {
-      this.setColor([0.05, 0.05, 0.05, 0.92]);
-      this.fillRect(-1, -1, 2, 2);
-      if (!displayChar) return;
-      this.setColor([0.6, 0.85, 1, 1]);
+      const alpha = panelAlpha();
+      if (!drawPanelChrome(this, alpha)) return;
+      if (!displayPinyin) return;
+      // Small title
+      this.setColor([0.0, 1.0, 0.9, alpha]);
+      this.textHeight(0.13);
+      this.text('PINYIN', 0, 0.65, 'center');
+      // Pinyin reading
+      this.setColor([1, 1, 1, alpha]);
+      this.textHeight(0.32);
+      this.text(displayPinyin, 0, -0.05, 'center');
+   };
+
+   g2Meaning.render = function () {
+      const alpha = panelAlpha();
+      if (!drawPanelChrome(this, alpha)) return;
+      if (!displayMeaning) return;
+      // Small title
+      this.setColor([0.0, 1.0, 0.9, alpha]);
+      this.textHeight(0.13);
+      this.text('MEANING', 0, 0.65, 'center');
+      // Meaning — capped to first '/' segment per spec ("máximo 1 meaning")
+      const firstMeaning = displayMeaning.split('/')[0].trim();
+      this.setColor([1, 1, 1, alpha]);
       this.textHeight(0.22);
-      this.text(displayPinyin || '', 0, 0.35, 'center');
-      this.setColor([0.6, 0.6, 0.6, 1]);
-      this.textHeight(0.14);
-      this.text(displayMeaning || '', 0, -0.1, 'center');
+      this.text(firstMeaning, 0, -0.05, 'center');
    };
 
    g2Image.render = function () {
-      this.setColor([0.05, 0.05, 0.05, 0.92]);
-      this.fillRect(-1, -1, 2, 2);
-      if (!displayChar) return;
+      const alpha = panelAlpha();
+      if (!drawPanelChrome(this, alpha)) return;
       if (displayImage) {
          const ctx = this.getContext();
          const canvas = this.getCanvas();
@@ -136,36 +239,37 @@ export const init = async model => {
          const boxAspect = pw / ph;
          let dw, dh;
          if (imgAspect > boxAspect) { dw = pw; dh = pw / imgAspect; }
-         else { dh = ph; dw = ph * imgAspect; }
+         else                       { dh = ph; dw = ph * imgAspect; }
          const dx = margin + (pw - dw) / 2;
          const dy = margin + (ph - dh) / 2;
+         // Apply alpha to the image draw
+         ctx.globalAlpha = alpha;
          ctx.drawImage(displayImage, dx, dy, dw, dh);
+         ctx.globalAlpha = 1.0;
       } else {
-         this.setColor([0.15, 0.15, 0.15, 1]);
-         this.fillRect(-0.9, -0.9, 1.8, 1.8);
-         this.setColor([0.3, 0.3, 0.3, 1]);
+         this.setColor([0.3, 0.3, 0.3, alpha]);
          this.textHeight(0.12);
          this.text('loading image...', 0, 0, 'center');
       }
    };
 
    g2AI.render = function () {
-      this.setColor([0.05, 0.05, 0.05, 0.92]);
-      this.fillRect(-1, -1, 2, 2);
-      if (!displayChar) return;
+      const alpha = panelAlpha();
+      if (!drawPanelChrome(this, alpha)) return;
       if (displayAI) {
-         this.setColor([0.85, 0.85, 0.85, 1]);
+         this.setColor([0.85, 0.85, 0.85, alpha]);
          this.textHeight(0.13);
-         let words = displayAI.split(' ');
-         let lines = [], line = '';
-         for (let w of words) {
+         const words = displayAI.split(' ');
+         const lines = [];
+         let line = '';
+         for (const w of words) {
             if ((line + w).length > 20) { lines.push(line.trim()); line = ''; }
             line += w + ' ';
          }
          if (line.trim()) lines.push(line.trim());
          this.text(lines.join('\n'), 0, 0, 'center');
       } else {
-         this.setColor([0.3, 0.3, 0.3, 1]);
+         this.setColor([0.3, 0.3, 0.3, alpha]);
          this.textHeight(0.12);
          this.text('asking AI...', 0, 0, 'center');
       }
@@ -196,7 +300,128 @@ export const init = async model => {
       }
    };
 
-   // ── FETCH WIKIPEDIA IMAGE + AI SENTENCE ──────────────────────────────────
+   // ─────────────────────────────────────────────────────────────────────────
+   // SURFACE VFX RENDER (LIDAR scan + persistent perimeter)
+   // ─────────────────────────────────────────────────────────────────────────
+   // The G2 canvas spans [-1..1] which maps to the full marker zone (corner
+   // ArUcos sit at ±1, ±1 in this canvas's space). All drawing happens in
+   // this normalized space.
+   g2Surface.render = function () {
+      const ctx = this.getContext(), canvas = this.getCanvas();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!surfaceActive) return;
+
+      const t = model.time - surfaceStartTime;
+      if (t < 0) return;
+
+      // Persistent perimeter — fades in linearly to alpha 0.5, stays there forever
+      const borderAlpha = Math.min(0.5, t * 0.5);
+      this.setColor([0.0, 1.0, 0.9, borderAlpha]);
+      this.lineWidth(0.015);
+      this.drawPath([[-0.98, -0.98], [0.98, -0.98], [0.98, 0.98], [-0.98, 0.98], [-0.98, -0.98]]);
+
+      // Initial LIDAR scan — only during the first T_SURFACE_SCAN seconds after lock
+      if (t <= T_SURFACE_SCAN) {
+         let pulseAlpha = 1.0;
+         if (t > 1.0) pulseAlpha = 1.0 - ((t - 1.0) * 2.0);
+
+         const maxRadius    = t * 2.8;
+         const waveGlowSize = 0.4;
+
+         // Cross-pattern dots that light up as the wave passes through
+         const step = 0.15, crossSize = 0.015;
+         this.lineWidth(0.008);
+         for (let x = -0.9; x <= 0.9; x += step) {
+            for (let y = -0.9; y <= 0.9; y += step) {
+               const dist = Math.sqrt(x * x + y * y);
+               const distanceToWave = maxRadius - dist;
+               if (distanceToWave > 0 && distanceToWave < waveGlowSize) {
+                  const dotAlpha = (1.0 - (distanceToWave / waveGlowSize)) * pulseAlpha;
+                  this.setColor([0.0, 1.0, 0.9, dotAlpha * 0.7]);
+                  this.drawPath([[x - crossSize, y], [x + crossSize, y]]);
+                  this.drawPath([[x, y - crossSize], [x, y + crossSize]]);
+               }
+            }
+         }
+
+         // Expanding ring
+         this.setColor([0.0, 1.0, 0.9, 0.5 * pulseAlpha]);
+         this.lineWidth(0.02);
+         this.drawOval(-maxRadius, -maxRadius, maxRadius * 2, maxRadius * 2);
+      }
+   };
+
+   // ─────────────────────────────────────────────────────────────────────────
+   // HANZI VFX RENDER (sparks + cardinal lines, anchored to bbox)
+   // ─────────────────────────────────────────────────────────────────────────
+   // Same coordinate space as g2Surface: [-1..1] = full zone area.
+   // The bbox (in zone-relative percentages) is converted to this space and
+   // used as the origin for all the FX.
+   //
+   // Conversion image-pct → G2 space:
+   //   gx = 2*char_x_pct - 1
+   //   gy = 1 - 2*char_y_pct      (image Y goes down, G2/world Y goes up)
+   //   half_w_g2 = bbox_w_pct     (half-width because pct→[-1..1] doubles)
+   //   half_h_g2 = bbox_h_pct
+   //
+   // Line length in G2 space:
+   //   line_g2 = 2 * HANZI_LINE_LEN / SQUARE_SIZE
+   g2HanziFX.render = function () {
+      const ctx = this.getContext(), canvas = this.getCanvas();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!hanziActive) return;
+
+      const t = model.time - hanziStartTime;
+      if (t < 0) return;
+
+      const cxp = mandarinState.char_x_pct;
+      const cyp = mandarinState.char_y_pct;
+      const wp  = mandarinState.bbox_w_pct;
+      const hp  = mandarinState.bbox_h_pct;
+      if (cxp == null || cyp == null || wp == null || hp == null) return;
+
+      const cx = 2 * cxp - 1;        // bbox center X in G2 [-1..1]
+      const cy = 1 - 2 * cyp;        // bbox center Y in G2 [-1..1]
+      const hw = wp;                 // bbox half-width in G2
+      const hh = hp;                 // bbox half-height in G2
+
+      // ── Phase 1: SPARKS (radial particles flying out from bbox center) ────
+      if (t < T_SPARK_DUR) {
+         const p = t / T_SPARK_DUR;
+         this.setColor([0.5, 1.0, 1.0, 1.0 - p]);
+         for (let i = 0; i < 8; i++) {
+            const angle = i * Math.PI / 4;
+            const r = p * 0.4;
+            const x = cx + Math.cos(angle) * r - 0.01;
+            const y = cy + Math.sin(angle) * r - 0.01;
+            this.fillOval(x, y, 0.02, 0.02);
+         }
+      }
+
+      // ── Phase 2: CARDINAL LINES (extend from bbox edge midpoints) ─────────
+      // Lines stay drawn after they finish extending (during panel phase).
+      if (t >= T_LINE_START) {
+         const lp = Math.min(1, (t - T_LINE_START) / T_LINE_DUR);
+         const lineLenG2 = 2 * HANZI_LINE_LEN / SQUARE_SIZE;
+         const target = lineLenG2 * lp;
+
+         this.setColor([0.0, 1.0, 0.9, 0.8]);
+         this.lineWidth(0.015);
+
+         // TOP    — from (cx, cy + hh) upward
+         this.drawPath([[cx, cy + hh], [cx, cy + hh + target]]);
+         // BOTTOM — from (cx, cy - hh) downward
+         this.drawPath([[cx, cy - hh], [cx, cy - hh - target]]);
+         // LEFT   — from (cx - hw, cy) leftward
+         this.drawPath([[cx - hw, cy], [cx - hw - target, cy]]);
+         // RIGHT  — from (cx + hw, cy) rightward
+         this.drawPath([[cx + hw, cy], [cx + hw + target, cy]]);
+      }
+   };
+
+   // ─────────────────────────────────────────────────────────────────────────
+   // FETCH WIKIPEDIA IMAGE + AI SENTENCE
+   // ─────────────────────────────────────────────────────────────────────────
    async function fetchWikiAndAI(meaning) {
       if (!meaning) return;
       const wikiTerm = meaning.split('/')[0].trim();
@@ -215,7 +440,7 @@ export const init = async model => {
       }
 
       try {
-         const prompt = `In 10 words or less, give one factual and memorable sentence about "${wikiTerm}". No metaphors, just a clear memorable fact.`;
+         const prompt = `In 6 words or less, give one factual and memorable sentence about "${wikiTerm}". No metaphors, just a clear memorable fact.`;
          displayAI = await askAI(prompt);
       } catch (e) {
          console.warn('AI fetch failed:', e);
@@ -226,15 +451,13 @@ export const init = async model => {
    function hidePanels() {
       displayChar = displayPinyin = displayMeaning = displayImage = displayAI = null;
       lastFetchedMeaning = null;
+      hanziActive = false;
    }
 
    // ── Manual lock trigger (headset controller button) ───────────────────────
    // Fires on whichever client receives the input — typically the headset,
    // since that's where the controllers are. Bumps lockCounter and broadcasts
    // so the PC Master can pick it up via synchronize at the top of animate.
-   // The PC also broadcasts mandarinState every frame, but the headset does
-   // NOT — so this explicit broadcast is essential for headset-originated
-   // state changes to ever reach the server.
    inputEvents.onPress = hand => {
       mandarinState.lockCounter = (mandarinState.lockCounter || 0) + 1;
       server.broadcastGlobal('mandarinState');
@@ -244,14 +467,18 @@ export const init = async model => {
    // ── MASTER CLIENT (PC) ONLY ──────────────────────────────────────────────
    if (clientID == clients[0]) {
 
-      mandarinState.status = 'empty';
-      mandarinState.character = null;
-      mandarinState.pinyin = null;
-      mandarinState.meaning = null;
-      mandarinState.erased = false;
+      mandarinState.status     = 'empty';
+      mandarinState.character  = null;
+      mandarinState.pinyin     = null;
+      mandarinState.meaning    = null;
+      mandarinState.erased     = false;
       mandarinState.srcCorners = null;
-      mandarinState.frameW = 0;
-      mandarinState.frameH = 0;
+      mandarinState.frameW     = 0;
+      mandarinState.frameH     = 0;
+      mandarinState.char_x_pct = null;
+      mandarinState.char_y_pct = null;
+      mandarinState.bbox_w_pct = null;
+      mandarinState.bbox_h_pct = null;
 
       let canvas = document.createElement('canvas');
       let ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -349,19 +576,29 @@ export const init = async model => {
             }
 
             if (result.character) {
-               mandarinState.status = 'drawn';
-               mandarinState.character = result.character;
-               mandarinState.pinyin = result.pinyin;
-               mandarinState.meaning = result.meaning;
-               mandarinState.erased = false;
+               mandarinState.status     = 'drawn';
+               mandarinState.character  = result.character;
+               mandarinState.pinyin     = result.pinyin;
+               mandarinState.meaning    = result.meaning;
+               mandarinState.erased     = false;
+               // Bbox info — needed by the headset to anchor the hanzi VFX
+               // around the actual character location on the surface.
+               mandarinState.char_x_pct = result.char_x_pct ?? null;
+               mandarinState.char_y_pct = result.char_y_pct ?? null;
+               mandarinState.bbox_w_pct = result.bbox_w_pct ?? null;
+               mandarinState.bbox_h_pct = result.bbox_h_pct ?? null;
             }
 
             else if (result.erased === true) {
-               mandarinState.status = 'empty';
-               mandarinState.character = null;
-               mandarinState.pinyin = null;
-               mandarinState.meaning = null;
-               mandarinState.erased = true;
+               mandarinState.status     = 'empty';
+               mandarinState.character  = null;
+               mandarinState.pinyin     = null;
+               mandarinState.meaning    = null;
+               mandarinState.erased     = true;
+               mandarinState.char_x_pct = null;
+               mandarinState.char_y_pct = null;
+               mandarinState.bbox_w_pct = null;
+               mandarinState.bbox_h_pct = null;
                // srcCorners/frameW/frameH intentionally preserved — the physical
                // zone is still there, only the character was erased.
             }
@@ -376,10 +613,6 @@ export const init = async model => {
       setInterval(pollServer, 500);
 
       // ── Reset key (R) — clears the current zone & reverts backend state ───
-      // Bumping resetCounter triggers F3's clear logic on every client (via the
-      // mandarinState broadcast). The /reset call reverts the server from
-      // TRACKING_ARUCO back to SEARCHING_RED so the next valid red-dot frame
-      // re-establishes the workspace.
       window.addEventListener('keydown', (e) => {
          if (e.key !== 'r' && e.key !== 'R') return;
          console.log('[MRandarin] reset key pressed');
@@ -392,6 +625,10 @@ export const init = async model => {
          mandarinState.meaning      = null;
          mandarinState.status       = 'empty';
          mandarinState.erased       = false;
+         mandarinState.char_x_pct   = null;
+         mandarinState.char_y_pct   = null;
+         mandarinState.bbox_w_pct   = null;
+         mandarinState.bbox_h_pct   = null;
          fetch('http://localhost:1111/reset', { method: 'POST' })
             .catch(err => console.warn('[MRandarin] /reset failed:', err));
       });
@@ -400,11 +637,11 @@ export const init = async model => {
    // ── ALL CLIENTS ───────────────────────────────────────────────────────────
    let lastCharacter = undefined;
    let lastFetchedMeaning = null;
-   let lastViewMatrix = null;          // refreshed every animate tick
-   let localPanelMatrix = null;        // computed locally on this client (uses LOCAL viewMatrix)
-   let activeZone = null;        // captured ONCE on first valid srcCorners; persists through erase
-   let lastResetCounter = 0;           // tracks mandarinState.resetCounter to detect resets across clients
-   let lastLockCounter  = 0;           // tracks mandarinState.lockCounter to detect manual lock presses across clients
+   let lastViewMatrix = null;
+   let localPanelMatrix = null;       // recomputed when a new character is detected (uses LOCAL viewMatrix)
+   let activeZone = null;             // captured ONCE on first valid srcCorners; persists through erase
+   let lastResetCounter = 0;
+   let lastLockCounter  = 0;
 
    // Build a square→model-space pose from the four image-space corners returned
    // by the server. Uses THIS client's current inverseViewMatrix(0), so when run
@@ -444,13 +681,13 @@ export const init = async model => {
    }
 
    // Position `panel` at world point `pos`, oriented by `mat`'s basis, scaled by `size`.
-   // Used for both info panels (localPanelMatrix) and ArUco panels (activeZone).
+   // size = HALF-extent (because the unit square spans [-1..1]).
    function placePanelAt(panel, pos, mat, size) {
       panel.setMatrix([
          mat[0] * size, mat[1] * size, mat[2] * size, 0,
          mat[4] * size, mat[5] * size, mat[6] * size, 0,
-         mat[8], mat[9], mat[10], 0,
-         pos[0], pos[1], pos[2], 1,
+         mat[8],        mat[9],        mat[10],       0,
+         pos[0],        pos[1],        pos[2],        1,
       ]);
    }
 
@@ -470,34 +707,35 @@ export const init = async model => {
       ];
 
       // ── Reset signal — clear local zone state when counter advances ───────
-      // Handled here (not just in the keydown listener) so the headset picks
-      // it up too via the broadcasted resetCounter, not only the PC where the
-      // key was actually pressed. Animate hides the panels on the next tick.
       const currentResetCounter = mandarinState.resetCounter || 0;
       if (currentResetCounter !== lastResetCounter) {
          lastResetCounter = currentResetCounter;
-         activeZone = null;
+         activeZone     = null;
+         surfaceActive  = false;        // wipe the surface VFX too
+         hanziActive    = false;
          hidePanels();
       }
 
       // ── Lock signal — capture activeZone (all clients) + switch backend (PC only) ──
       // Bulletproof gate against spurious triggers on page load:
-      //   1. Strict monotonic check (>) — only ADVANCING the counter triggers,
-      //      never going backward or syncing a stale value from the server.
-      //   2. lastLockCounter is claimed FIRST, before any work, so even if we
-      //      bail out below we never re-enter on the same value.
+      //   1. Strict monotonic check (>) — only ADVANCING the counter triggers.
+      //   2. lastLockCounter is claimed FIRST, before any work.
       //   3. activeZone capture AND the /lock fetch are BOTH gated on
-      //      srcCorners — without it we'd be telling the backend to track
-      //      ArUcos that haven't been rendered yet (the bug that caused the
-      //      "Markers not found" spam loop on page load).
+      //      srcCorners.
+      // Surface VFX re-triggers on every lock (per spec) — startTime is
+      // updated regardless of whether activeZone is being captured for the
+      // first time or refreshed.
       const currentLock = mandarinState.lockCounter || 0;
       if (currentLock > lastLockCounter) {
-         lastLockCounter = currentLock;   // claim it IMMEDIATELY
+         lastLockCounter = currentLock;
          if (mandarinState.srcCorners && mandarinState.frameW && mandarinState.frameH) {
             activeZone = computeLocalPanelMatrix(
                mandarinState.srcCorners, mandarinState.frameW, mandarinState.frameH
             );
-            console.log('[MRandarin] zone locked');
+            // Trigger surface VFX scan animation
+            surfaceActive    = true;
+            surfaceStartTime = model.time;
+            console.log('[MRandarin] zone locked → surface VFX triggered');
             // PC Master only — and only after we know srcCorners is real.
             if (clientID == clients[0]) {
                fetch('http://localhost:1111/lock', { method: 'POST' })
@@ -514,20 +752,20 @@ export const init = async model => {
          lastCharacter = mandarinState.character;
 
          if (mandarinState.character && mandarinState.meaning && !shouldClear) {
-            displayChar = mandarinState.character;
-            displayPinyin = mandarinState.pinyin;
+            displayChar    = mandarinState.character;
+            displayPinyin  = mandarinState.pinyin;
             displayMeaning = mandarinState.meaning;
-            displayImage = null;
-            displayAI = null;
-            // ── Compute the panel pose LOCALLY using this client's viewMatrix ──
-            // On the headset, this means panels anchor to where the user's head
-            // actually is right now (not where the PC's static view says it is).
-            // On the PC master, this still runs but the result is mostly meaningless
-            // because the PC has no real XR view — its panels stay invisible because
-            // they're in screen-space rather than the user's view anyway.
+            displayImage   = null;
+            displayAI      = null;
+            // Compute the panel pose LOCALLY using this client's viewMatrix.
+            // (On PC it's mostly a no-op since panels are out of view there;
+            // on headset this is what anchors the panels to the user's view.)
             localPanelMatrix = computeLocalPanelMatrix(
                mandarinState.srcCorners, mandarinState.frameW, mandarinState.frameH
             );
+            // Trigger hanzi VFX (sparks → lines → panels)
+            hanziActive    = true;
+            hanziStartTime = model.time;
             if (mandarinState.meaning !== lastFetchedMeaning) {
                lastFetchedMeaning = mandarinState.meaning;
                if (clientID != clients[0]) {
@@ -561,50 +799,98 @@ export const init = async model => {
          g2Debug.update();
       }
 
-      // ── Place the 4 ArUco hologram panels on the saved zone corners ───────
+      // ─────────────────────────────────────────────────────────────────────
+      // SCENE PLACEMENT — based on activeZone & character state
+      // ─────────────────────────────────────────────────────────────────────
       if (activeZone) {
          const Mz = activeZone;
          const halfZ = (SQUARE_SIZE / 2) * PANEL_SPREAD;
-         const aTL = transform(Mz, [-halfZ, halfZ, 0]);
-         const aTR = transform(Mz, [halfZ, halfZ, 0]);
-         const aBR = transform(Mz, [halfZ, -halfZ, 0]);
-         const aBL = transform(Mz, [-halfZ, -halfZ, 0]);
 
+         // ── Surface VFX panel: covers the entire zone, coplanar ────────────
+         const zoneCenter = transform(Mz, [0, 0, 0]);
+         placePanelAt(surfaceObj, zoneCenter, Mz, SQUARE_SIZE / 2);
+
+         // ── ArUco hologram panels at the 4 corners ─────────────────────────
+         const aTL = transform(Mz, [-halfZ,  halfZ, 0]);
+         const aTR = transform(Mz, [ halfZ,  halfZ, 0]);
+         const aBR = transform(Mz, [ halfZ, -halfZ, 0]);
+         const aBL = transform(Mz, [-halfZ, -halfZ, 0]);
          placePanelAt(arucoTL, aTL, Mz, ARUCO_SIZE);
          placePanelAt(arucoTR, aTR, Mz, ARUCO_SIZE);
          placePanelAt(arucoBR, aBR, Mz, ARUCO_SIZE);
          placePanelAt(arucoBL, aBL, Mz, ARUCO_SIZE);
       } else {
-         const hidden = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, -999, 0, 1];
-         arucoTL.setMatrix(hidden);
-         arucoTR.setMatrix(hidden);
-         arucoBR.setMatrix(hidden);
-         arucoBL.setMatrix(hidden);
+         surfaceObj.setMatrix(HIDDEN_MATRIX);
+         arucoTL.setMatrix(HIDDEN_MATRIX);
+         arucoTR.setMatrix(HIDDEN_MATRIX);
+         arucoBR.setMatrix(HIDDEN_MATRIX);
+         arucoBL.setMatrix(HIDDEN_MATRIX);
       }
 
-      // ── Place the 4 info panels in the world, anchored to the marker square ──
+      // ── Hanzi VFX + info panels (anchored to bbox within activeZone) ──────
       const M = localPanelMatrix;
-      if (M && displayChar) {
-         const half = (SQUARE_SIZE / 2) * PANEL_SPREAD;
-         const cornerTL = transform(M, [-half, half, 0]);
-         const cornerTR = transform(M, [half, half, 0]);
-         const cornerBL = transform(M, [-half, -half, 0]);
-         const cornerBR = transform(M, [half, -half, 0]);
+      const haveBbox =
+         displayChar &&
+         M &&
+         mandarinState.char_x_pct != null &&
+         mandarinState.char_y_pct != null &&
+         mandarinState.bbox_w_pct != null &&
+         mandarinState.bbox_h_pct != null;
 
-         placePanelAt(panelChar, cornerTL, M, PANEL_SIZE);
-         placePanelAt(panelPinyin, cornerTR, M, PANEL_SIZE);
-         placePanelAt(panelImage, cornerBL, M, PANEL_SIZE);
-         placePanelAt(panelAI, cornerBR, M, PANEL_SIZE);
+      if (haveBbox) {
+         // Bbox geometry in zone-local meters
+         const localCenterX = (mandarinState.char_x_pct - 0.5) * SQUARE_SIZE;
+         const localCenterY = -(mandarinState.char_y_pct - 0.5) * SQUARE_SIZE;
+         const localW       = mandarinState.bbox_w_pct * SQUARE_SIZE;
+         const localH       = mandarinState.bbox_h_pct * SQUARE_SIZE;
+         const bboxSide     = Math.max(localW, localH);             // square panels per spec
+         const halfBbox     = bboxSide / 2;
+         const panelHalf    = (HANZI_PANEL_MUL * bboxSide) / 2;
+         const offset       = halfBbox + HANZI_LINE_LEN + panelHalf; // bbox edge → panel center
+
+         // Hanzi VFX panel: same plane & extent as the surface VFX
+         const zoneCenter = transform(M, [0, 0, 0]);
+         placePanelAt(hanziFXObj, zoneCenter, M, SQUARE_SIZE / 2);
+
+         // Panel grow animation (ease-out cubic, synced with alpha fade-in)
+         const t  = model.time - hanziStartTime;
+         const pp = Math.max(0, Math.min(1, (t - T_PANEL_START) / T_PANEL_DUR));
+         const ease = 1 - Math.pow(1 - pp, 3);
+         const animatedHalf = panelHalf * ease;
+
+         if (animatedHalf > 0.001) {
+            // Cardinal positions: TOP=meaning, BOTTOM=AI, LEFT=image, RIGHT=pinyin
+            const topPos    = transform(M, [localCenterX, localCenterY + offset, 0]);
+            const bottomPos = transform(M, [localCenterX, localCenterY - offset, 0]);
+            const leftPos   = transform(M, [localCenterX - offset, localCenterY, 0]);
+            const rightPos  = transform(M, [localCenterX + offset, localCenterY, 0]);
+
+            placePanelAt(panelMeaning, topPos,    M, animatedHalf);
+            placePanelAt(panelAI,      bottomPos, M, animatedHalf);
+            placePanelAt(panelImage,   leftPos,   M, animatedHalf);
+            placePanelAt(panelPinyin,  rightPos,  M, animatedHalf);
+         } else {
+            panelMeaning.setMatrix(HIDDEN_MATRIX);
+            panelAI.setMatrix(HIDDEN_MATRIX);
+            panelImage.setMatrix(HIDDEN_MATRIX);
+            panelPinyin.setMatrix(HIDDEN_MATRIX);
+         }
       } else {
-         const hidden = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, -999, 0, 1];
-         panelChar.setMatrix(hidden);
-         panelPinyin.setMatrix(hidden);
-         panelImage.setMatrix(hidden);
-         panelAI.setMatrix(hidden);
+         hanziFXObj.setMatrix(HIDDEN_MATRIX);
+         panelMeaning.setMatrix(HIDDEN_MATRIX);
+         panelAI.setMatrix(HIDDEN_MATRIX);
+         panelImage.setMatrix(HIDDEN_MATRIX);
+         panelPinyin.setMatrix(HIDDEN_MATRIX);
       }
 
-      g2Char.update();
+      // panelChar stays hidden by spec
+      panelChar.setMatrix(HIDDEN_MATRIX);
+
+      // ── Update G2 canvases ────────────────────────────────────────────────
+      g2Surface.update();
+      g2HanziFX.update();
       g2Pinyin.update();
+      g2Meaning.update();
       g2Image.update();
       g2AI.update();
 
@@ -628,7 +914,17 @@ export const init = async model => {
             'lockCounter:  ' + (mandarinState.lockCounter  || 0),
             'resetCounter: ' + (mandarinState.resetCounter || 0),
             'activeZone:   ' + (activeZone ? 'YES ✅' : 'no ❌'),
+            'surfaceVFX:   ' + (surfaceActive ? 'active' : 'idle'),
+            'hanziVFX:     ' + (hanziActive ? 'active' : 'idle'),
          ];
+
+         if (mandarinState.char_x_pct != null) {
+            lines.push('');
+            lines.push('bbox center:  (' + mandarinState.char_x_pct.toFixed(3) +
+                                    ', ' + mandarinState.char_y_pct.toFixed(3) + ')');
+            lines.push('bbox size:    (' + mandarinState.bbox_w_pct.toFixed(3) +
+                                    ' × ' + mandarinState.bbox_h_pct.toFixed(3) + ')');
+         }
 
          if (sc) {
             lines.push('');
