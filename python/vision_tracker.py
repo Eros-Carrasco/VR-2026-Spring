@@ -119,3 +119,48 @@ def check_if_erased(bgr, bbox):
     dark_count = int(np.sum(gray < 80))
     total = gray.size
     return dark_count < 0.02 * total
+
+
+# ── ArUco detector setup (DICT_4X4_50, IDs 0-3 mapped to TL, TR, BR, BL) ────
+# Uses the OpenCV 4.7+ ArucoDetector class with a graceful fallback to the
+# legacy procedural API for older OpenCV builds. Requires opencv-contrib-python
+# (the cv2.aruco module is NOT in plain opencv-python).
+try:
+    _aruco_dict     = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    _aruco_params   = cv2.aruco.DetectorParameters()
+    _aruco_detector = cv2.aruco.ArucoDetector(_aruco_dict, _aruco_params)
+    _USE_NEW_ARUCO  = True
+except AttributeError:
+    # OpenCV ≤ 4.6
+    _aruco_dict     = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_50)
+    _aruco_params   = cv2.aruco.DetectorParameters_create()
+    _aruco_detector = None
+    _USE_NEW_ARUCO  = False
+
+
+def detect_aruco(bgr_image):
+    """Detect ArUco marker centroids (IDs 0-3 only).
+
+    Drop-in replacement for detect_markers — returns a list of (x, y) tuples,
+    one per detected marker, in arbitrary order. order_corners() will sort
+    them spatially into [TL, TR, BR, BL] downstream, same as for red dots.
+    """
+    if _USE_NEW_ARUCO:
+        corners, ids, _ = _aruco_detector.detectMarkers(bgr_image)
+    else:
+        corners, ids, _ = cv2.aruco.detectMarkers(
+            bgr_image, _aruco_dict, parameters=_aruco_params
+        )
+    if ids is None:
+        return []
+
+    centroids = []
+    for marker_corners, marker_id in zip(corners, ids.flatten()):
+        if int(marker_id) not in (0, 1, 2, 3):
+            continue
+        # marker_corners shape: (1, 4, 2) — average the 4 corners for the center
+        pts = marker_corners[0]
+        cx = int(pts[:, 0].mean())
+        cy = int(pts[:, 1].mean())
+        centroids.append((cx, cy))
+    return centroids

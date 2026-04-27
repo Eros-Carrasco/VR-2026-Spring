@@ -9,12 +9,14 @@ from flask_cors import CORS
 
 from vision_tracker import (
     detect_markers,
+    detect_aruco,
     order_corners,
     normalize_image,
     is_valid_quad,
     check_if_erased,
     bgr_to_png_bytes,
 )
+
 from vision_ocr import (
     is_chinese,
     run_vision_ocr,
@@ -26,6 +28,12 @@ CORS(app)
 
 # Suppress Flask's per-request access log — only show errors
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
+# State machine: 'SEARCHING_RED' uses HSV red-dot detection (used once at
+# startup or after /reset); 'TRACKING_ARUCO' uses ArUco IDs 0-3 (used after
+# the workspace is locked, so hand occlusion of the physical dots stops
+# breaking the quad — the headset's holograms render on top of the hand).
+_state = 'SEARCHING_RED'
 
 # Debug state shared between /predict and /debug
 _debug_state = {
@@ -39,6 +47,10 @@ _debug_state = {
     'locked_bbox': None,  # (x, y, w, h) pixel coords of locked character
 }
 
+def _src_corners_payload(centroids, img_w, img_h):
+    """Format 4 ordered centroids as the API's src_corners payload."""
+    ordered = order_corners(centroids)
+    return [[round(x / img_w, 4), round(y / img_h, 4)] for (x, y) in ordered]
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -47,15 +59,33 @@ def predict():
         if not data or 'image' not in data:
             return jsonify({'character': None, 'error': 'no image'})
 
+        global _state
+
         image_bytes = base64.b64decode(data['image'])
 
         np_arr = np.frombuffer(image_bytes, dtype=np.uint8)
         bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        img_h, img_w = bgr.shape[:2]
+
+        # --- Detect zone using the active detector (red dots OR ArUco) ───────
+        # Same downstream logic regardless of which detector ran: order_corners
+        # will spatially sort the 4 centroids into [TL, TR, BR, BL].
+        if _state == 'SEARCHING_RED':
+            centroids = detect_markers(bgr)
+        else:  # TRACKING_ARUCO
+            centroids = detect_aruco(bgr)
+        valid_quad = len(centroids) == 4 and is_valid_quad(centroids)
+
+        # State transition: first valid red-dot quad locks the workspace.
+        # From here on, ArUco holograms (rendered by the headset over the dots)
+        # do the tracking — hand occlusion of the physical dots no longer breaks
+        # the quad, because the holograms render on top of the hand in the cast.
+        if _state == 'SEARCHING_RED' and valid_quad:
+            _state = 'TRACKING_ARUCO'
+            print('[state] SEARCHING_RED → TRACKING_ARUCO (workspace locked)')
 
         # --- Lock-on: skip OCR while a character is locked, check for erase instead ---
         if _debug_state['locked']:
-            centroids = detect_markers(bgr)
-            valid_quad = len(centroids) == 4 and is_valid_quad(centroids)
             if not valid_quad:
                 # Can't reliably check erase without all 4 markers; pause without dropping lock.
                 _debug_state['markers_found'] = False
@@ -67,21 +97,17 @@ def predict():
             _debug_state['markers_found'] = True
             _debug_state['markers'] = centroids
             _debug_state['image'] = check_src.copy()
+            src_corners = _src_corners_payload(centroids, img_w, img_h)
             if check_if_erased(check_src, _debug_state['locked_bbox']):
                 _debug_state['locked'] = False
                 _debug_state['locked_bbox'] = None
                 _debug_state['character'] = None
                 _debug_state['confidence'] = None
                 _debug_state['timestamp'] = datetime.now().isoformat(timespec='seconds')
-                return jsonify({'character': None, 'erased': True})
-            return jsonify({'character': None})
-
-        img_h, img_w = bgr.shape[:2]
+                return jsonify({'character': None, 'erased': True, 'src_corners': src_corners})
+            return jsonify({'character': None, 'src_corners': src_corners})
 
         # --- Marker detection & image normalization ---
-        centroids = detect_markers(bgr)
-        valid_quad = len(centroids) == 4 and is_valid_quad(centroids)
-
         if not valid_quad:
             # Strict mode: no recognition without a valid quad of 4 markers.
             if centroids:
@@ -160,7 +186,7 @@ def predict():
                     'src_corners': [[round(x, 4), round(y, 4)] for (x, y) in src_corners_norm] if src_corners_norm else None,
                 })
 
-        return jsonify({'character': None})
+        return jsonify({'character': None, 'src_corners': _src_corners_payload(centroids, img_w, img_h)})
 
     except Exception as e:
         print(f'error: {e}')
@@ -259,6 +285,24 @@ def debug():
 </html>"""
     return html, 200, {'Content-Type': 'text/html; charset=utf-8'}
 
+@app.route('/reset', methods=['POST'])
+def reset():
+    """Revert the server to SEARCHING_RED and clear all per-session state.
+
+    Called by the frontend's R key. After this returns, the next /predict that
+    sees a valid red-dot quad will lock the zone and switch back to ArUco mode.
+    """
+    global _state
+    _state = 'SEARCHING_RED'
+    _debug_state['locked']        = False
+    _debug_state['locked_bbox']   = None
+    _debug_state['character']     = None
+    _debug_state['confidence']    = None
+    _debug_state['markers_found'] = False
+    _debug_state['markers']       = []
+    _debug_state['timestamp']     = datetime.now().isoformat(timespec='seconds')
+    print('[state] RESET → SEARCHING_RED')
+    return jsonify({'status': 'reset', 'state': _state})
 
 @app.route('/health', methods=['GET'])
 def health():
