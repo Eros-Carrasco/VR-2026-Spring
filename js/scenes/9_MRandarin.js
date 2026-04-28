@@ -32,6 +32,11 @@ export const init = async model => {
 
    global.scene().addNode(new Gltf2Node({ url: "" })).name = "backGround";
 
+   // Oculta el esqueleto de manos y desactiva el pinch-2 (pulgar-dedo medio) de teletransporte
+   window.suppress_vrWidgets = true;
+   const _origPinch = clientState.pinch;
+   clientState.pinch = (id, hand, i) => i === 2 ? false : _origPinch(id, hand, i);
+
    // ── Debug HUD ─────────────────────────────────────────────────────────────
    const DEBUG_HUD = false;
    const DEBUG_HUD_DISTANCE = 1;
