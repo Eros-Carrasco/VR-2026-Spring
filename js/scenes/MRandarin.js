@@ -32,6 +32,11 @@ export const init = async model => {
 
    global.scene().addNode(new Gltf2Node({ url: "" })).name = "backGround";
 
+   // Oculta el esqueleto de manos y desactiva el pinch-2 (pulgar-dedo medio) de teletransporte
+   window.suppress_vrWidgets = true;
+   const _origPinch = clientState.pinch;
+   clientState.pinch = (id, hand, i) => i === 2 ? false : _origPinch(id, hand, i);
+
    // ── Debug HUD ─────────────────────────────────────────────────────────────
    const DEBUG_HUD = false;
    const DEBUG_HUD_DISTANCE = 1;
@@ -43,7 +48,7 @@ export const init = async model => {
    const SQUARE_FL    = 0.5;   // focal length in normalized image units; tweak if depth feels off
    const SQUARE_SIZE  = 0.5;   // physical side of the marker square, in meters
    const PANEL_SPREAD = 1.0;   // 1.0 = panels exactly on marker corners; >1.0 pushes them outward
-   const ARUCO_SIZE   = 0.02;  // physical side of each ArUco hologram, in meters (TUNE)
+   const ARUCO_SIZE   = 0.03;  // physical side of each ArUco hologram, in meters (TUNE)
 
    // ── Hanzi VFX constants (TUNE THESE) ──────────────────────────────────────
    const HANZI_LINE_LEN  = 0.04;  // meters — length of cardinal lines from bbox edge to panel
