@@ -46,56 +46,79 @@ export const init = async model => {
 
    // ── Marker square pose constants ──────────────────────────────────────────
    //
-   // Why the depth is FORCED to QUEST_FOCAL_DISTANCE instead of being recovered
-   // from the homography:
-   //
-   //   The PnP/homography solver has an inherent scale ambiguity — a 50 cm
-   //   square at 1.3 m looks IDENTICAL in a single image to a 100 cm square at
-   //   2.6 m. To get a metric depth, you have to know ONE of: the physical
-   //   size of the model, OR the depth. We don't know the physical spacing of
-   //   the user's red dots (it can be any size whiteboard), but we DO have
-   //   a useful hint: the Meta Quest 3S has a fixed optical focal distance of
-   //   ~1.3 m. The user is naturally going to stand at roughly that distance
-   //   to read the writing comfortably.
-   //
-   //   So instead of trusting the recovered depth (which is wrong by an
-   //   unknown factor), we anchor the zone center at exactly 1.3 m along the
-   //   camera ray that points at the centroid of the four dots. Because a
-   //   uniform scaling of the translation preserves the projections of all
-   //   four corners onto the image plane, the four ArUco holograms end up
-   //   projecting EXACTLY on top of the four red dots in the cast — and from
-   //   the headset's own viewpoint they sit on the whiteboard.
-   //
-   const QUEST_FOCAL_DISTANCE = 1.3;   // meters — Quest 3S optical focal distance
+   // PnP from a single image needs ONE of two things to recover metric depth:
+   //   (a) the physical size of the model square, or
+   //   (b) the depth from camera to plane.
+   // Earlier versions of this file went with (b), pinning depth to the Quest 3S
+   // optical focal distance (~1.3 m). That made image-space alignment work but
+   // only landed the zone on the actual whiteboard if you happened to be standing
+   // exactly 1.3 m away — closer or farther and the zone slid behind or in front
+   // of the wall. We now use (a): the user measures the side of their dot
+   // square, plugs it into ZONE_SIDE, and PnP returns metrically correct depth
+   // regardless of where the user stands. ZONE_SIDE can be tuned live with
+   // , and . keys on the PC.
    //
    // SQUARE_FL — pinhole focal length of the cast camera, in image-WIDTH-relative
    // units (i.e. the image is 1.0 unit wide). Drives both the per-dot ray-cast
-   // for the live cyan reticles AND the homography-based pose recovery at lock
-   // time. The relation to horizontal FOV:
+   // preview AND the metric homography. Relation to horizontal FOV:
    //     SQUARE_FL = 0.5 / tan(H_FOV / 2)
    //
-   //   0.5  → 90° H FOV (a generic "wide" assumption — almost certainly wrong
-   //                     for the Quest 3S cast)
-   //   0.6  → 80° H FOV
-   //   0.68 → 73° H FOV  ← measured empirically on Quest 3S cast (default)
-   //   0.7  → 71° H FOV
-   //   0.75 → 67° H FOV
+   //   0.32 → 115° H FOV   ← measured empirically on Quest 3S "wide" cast
+   //   0.5  → 90°  H FOV
+   //   0.68 → 73°  H FOV
+   //   0.75 → 67°  H FOV
    //
    // The right value is whatever makes the cyan reticles land EXACTLY on the
    // physical red dots in PREVIEW mode. If they're pushed outward from center,
    // SQUARE_FL is too small; if pulled inward, it's too big. Adjust live with
-   // the [  and  ] keys on the PC (see keyboard handler farther down). The
+   // the [ and ] keys on the PC (see keyboard handler farther down). The
    // value is broadcast via mandarinState.squareFL so both clients agree.
    //
-   // Declared with `let` rather than `const` so the keyboard tuner can update
-   // it at runtime without a page reload.
-   let   SQUARE_FL            = 0.68;  // empirically calibrated for Quest 3S cast
-   const SQUARE_FL_STEP       = 0.02;  // [ / ] increment when tuning
-   const SQUARE_FL_MIN        = 0.30;  // ≈ 118° H FOV — sanity floor
-   const SQUARE_FL_MAX        = 1.20;  // ≈ 45°  H FOV — sanity ceiling
-   const SOLVE_SIZE           = 1.0;   // arbitrary unit for the solver — gets normalized
-                                       // away by the depth-anchoring step below
-   const ARUCO_SIZE           = 0.03;  // physical side of each ArUco hologram, in meters
+   // Both SQUARE_FL and ZONE_SIDE are declared with `let` rather than `const`
+   // so the keyboard tuners can update them at runtime without a page reload.
+   //
+   // Calibration order is FL first, then SIDE:
+   //   1. [/]  → adjust SQUARE_FL until reticles align with dots in cast
+   //             (image-space alignment is independent of physical scale)
+   //   2. ,/.  → adjust ZONE_SIDE until reticles sit ON the whiteboard in 3D
+   //             (this only adjusts depth, not image-space alignment)
+   let   SQUARE_FL       = 0.32;   // ≈ 115° H FOV — typical Quest 3S "wide" cast
+   const SQUARE_FL_STEP  = 0.02;
+   const SQUARE_FL_MIN   = 0.20;   // ≈ 136° H FOV — sanity floor
+   const SQUARE_FL_MAX   = 1.20;   // ≈ 45°  H FOV — sanity ceiling
+
+   let   ZONE_SIDE       = 0.30;   // meters — side length of the dot square (defaults
+                                   // to 30 cm; measure your actual setup with a ruler
+                                   // and tune in 2 cm steps with , / . on the PC)
+   const ZONE_SIDE_STEP  = 0.02;
+   const ZONE_SIDE_MIN   = 0.05;   // 5 cm  — sanity floor
+   const ZONE_SIDE_MAX   = 3.00;   // 3 m   — sanity ceiling
+
+   const ARUCO_SIZE      = 0.03;   // physical side of each ArUco hologram, in meters
+
+   // Forward lift along the zone's local Z so the ArUcos and side plaques
+   // win the depth-buffer fight against the coplanar surface VFX. The sign
+   // here was determined empirically: in the locked screenshot, the surface
+   // VFX (mint green border + fill) was OCCLUDING the ArUco holograms,
+   // proving that the +Z of the PnP-recovered plane points TOWARD THE WALL,
+   // not toward the viewer. So a negative offset on Z lifts visuals toward
+   // the user.
+   //
+   // 1.5 cm is generous on purpose — small offsets like 5 mm risk losing the
+   // depth-fight under floating-point noise, and the lift is cheap visually
+   // (the user almost never looks at the zone edge-on, where the offset
+   // would become visible).
+   const ARUCO_Z_LIFT    = -0.015;  // 1.5 cm toward the viewer (negative because
+                                    // PnP +Z points toward the wall in this scene)
+
+   // Always-on side plaques (above & below the zone). Sized in absolute meters
+   // rather than as fractions of the zone — the zone (your dot square) might
+   // be quite small, but the plaques should stay readable. Adjust freely.
+   const TITLE_HALF_W    = 0.18;   // 36 cm wide
+   const TITLE_HALF_H    = 0.045;  //  9 cm tall
+   const COURSE_HALF_W   = 0.18;
+   const COURSE_HALF_H   = 0.07;   // 14 cm tall (4 lines of text)
+   const PLAQUE_GAP      = 0.025;  // 2.5 cm gap between plaque and zone edge
 
    // ── Joystick zone-resize constants ────────────────────────────────────────
    //
@@ -112,9 +135,10 @@ export const init = async model => {
    const ZONE_HALF_MAX     = 3.0;     // 3 m    — generous upper bound
 
    // ── Per-dot live indicator (visual feedback for detected red dots) ────────
-   // Cyan target reticle that floats at QUEST_FOCAL_DISTANCE on each red dot's
-   // ray, recomputed every frame from the LIVE srcCorners. Lets the user see
-   // the math working in real time BEFORE committing the zone with the trigger.
+   // Cyan target reticle placed at the corresponding corner of the metric PnP
+   // plane recovered from the LIVE srcCorners — recomputed every frame. Lets
+   // the user see the math working in real time BEFORE committing the zone
+   // with the trigger.
    //
    // Cyan (not red) on purpose — the backend's HSV detector hunts for red
    // blobs, and rendering 4 red holograms back into the casted view risks
@@ -160,6 +184,12 @@ export const init = async model => {
    // Single canvas shared by all four indicator panels (they all look the same).
    let g2DotIndicator = new G2();
 
+   // ── G2 canvases for the always-on info plaques (above & below the zone) ──
+   //    Static — drawn once at init, then just blitted onto their panels each
+   //    frame at whatever world pose the zone matrix dictates.
+   let g2Title      = new G2();   // "MR-andarin" header above the zone
+   let g2CourseInfo = new G2();   // course / instructor / date plaque below
+
    // ── Texture slot assignments ──────────────────────────────────────────────
    // 0-3 = ArUco PNGs (TL, TR, BR, BL)
    // 4   = panelChar (currently hidden, kept for future use)
@@ -167,10 +197,12 @@ export const init = async model => {
    // 6   = panelImage
    // 7   = panelAI
    // 8   = panelDebug
-   // 9   = g2Surface (LIDAR + perimeter)
+   // 9   = g2Surface (LIDAR + perimeter + intro animation)
    // 10  = g2HanziFX (sparks + lines)
    // 11  = panelMeaning
    // 12  = g2DotIndicator (per-dot live reticle, shared by all 4 indicators)
+   // 13  = g2Title (always-on "MR-andarin" header above the zone)
+   // 14  = g2CourseInfo (always-on course-info plaque below the zone)
    model.txtrSrc(0, '../media/mrandarin/ArUco_0.png');
    model.txtrSrc(1, '../media/mrandarin/ArUco_1.png');
    model.txtrSrc(2, '../media/mrandarin/ArUco_2.png');
@@ -184,21 +216,27 @@ export const init = async model => {
    model.txtrSrc(10, g2HanziFX.getCanvas());
    model.txtrSrc(11, g2Meaning.getCanvas());
    model.txtrSrc(12, g2DotIndicator.getCanvas());
+   model.txtrSrc(13, g2Title.getCanvas());
+   model.txtrSrc(14, g2CourseInfo.getCanvas());
 
    // ── Render order matters: later .add() calls draw ON TOP of earlier ones ──
    // Stack (bottom → top):
-   //   1. Surface VFX & Hanzi VFX (coplanar with the workspace)
-   //   2. Info panels (above the VFX, below the ArUco holograms)
-   //   3. ArUco holograms (always on top — they're the OpenCV tracking targets,
-   //      they MUST remain visible to the headset's casted view at all times,
-   //      especially during the VFX animation)
-   //   4. Dot indicators (topmost — pre-lock visual feedback only; hidden after lock)
+   //   1. Surface VFX & Hanzi VFX (coplanar with the workspace, z=0)
+   //   2. Info panels (z=0, hidden until characters are detected)
+   //   3. Always-on plaques: Title above, Course-info below (z = ARUCO_Z_LIFT)
+   //   4. ArUco holograms — slightly lifted (z = ARUCO_Z_LIFT) so they always
+   //      render IN FRONT OF the surface VFX. This was a real visual bug:
+   //      coplanar surfaces with equal z fight in the depth buffer, and the
+   //      surface VFX (drawn first, but with the same z) was occluding the
+   //      ArUcos in some frames, hurting OpenCV's ability to lock onto them
+   //      from the cast feed.
+   //   5. Dot indicators (topmost — pre-lock visual feedback only; hidden after lock)
 
    // 1. VFX layers (deepest)
    let surfaceObj = model.add('square').txtr(9).dull();
    let hanziFXObj = model.add('square').txtr(10).dull();
 
-   // 2. Info panels
+   // 2. Info panels (transient — show on character detection)
    let panelChar    = model.add('square').txtr(4).dull();
    let panelPinyin  = model.add('square').txtr(5).dull();
    let panelImage   = model.add('square').txtr(6).dull();
@@ -207,16 +245,20 @@ export const init = async model => {
    let panelDebug   = model.add('square').txtr(8).scale(DEBUG_HUD_SIZE).dull();
    if (!DEBUG_HUD) panelDebug.move(0, -999, 0);
 
-   // 3. ArUco holograms
+   // 3. Always-on plaques
+   let panelTitle      = model.add('square').txtr(13).dull();
+   let panelCourseInfo = model.add('square').txtr(14).dull();
+
+   // 4. ArUco holograms
    let arucoTL = model.add('square').txtr(0).dull();
    let arucoTR = model.add('square').txtr(1).dull();
    let arucoBR = model.add('square').txtr(2).dull();
    let arucoBL = model.add('square').txtr(3).dull();
 
-   // 4. Per-dot live indicators — one cyan reticle per detected red dot,
-   //    placed at QUEST_FOCAL_DISTANCE on each dot's individual camera ray and
-   //    recomputed every frame. Shown in PREVIEW (no zone yet, srcCorners
-   //    fresh) and hidden after lock.
+   // 5. Per-dot live indicators — one cyan reticle per detected red dot,
+   //    placed at the corresponding corner of the LIVE PnP plane (so they
+   //    track the dots in 2D AND sit at the correct 3D depth, given properly
+   //    calibrated SQUARE_FL and ZONE_SIDE). Shown in PREVIEW; hidden after lock.
    let dotInd0 = model.add('square').txtr(12).dull();
    let dotInd1 = model.add('square').txtr(12).dull();
    let dotInd2 = model.add('square').txtr(12).dull();
@@ -231,6 +273,8 @@ export const init = async model => {
    panelImage.setMatrix(HIDDEN_MATRIX);
    panelAI.setMatrix(HIDDEN_MATRIX);
    panelMeaning.setMatrix(HIDDEN_MATRIX);
+   panelTitle.setMatrix(HIDDEN_MATRIX);
+   panelCourseInfo.setMatrix(HIDDEN_MATRIX);
    arucoTL.setMatrix(HIDDEN_MATRIX);
    arucoTR.setMatrix(HIDDEN_MATRIX);
    arucoBR.setMatrix(HIDDEN_MATRIX);
@@ -249,6 +293,9 @@ export const init = async model => {
 
    // ── VFX state ─────────────────────────────────────────────────────────────
    let surfaceActive   = false;     // becomes true on first lock; stays true (perimeter persists)
+   let surfacePreviewActive = false;// true while in PREVIEW (4 dots detected, no lock yet);
+                                    // makes the surface canvas draw a translucent ghost outline
+                                    // showing where the zone WILL be locked
    let surfaceStartTime = 9999.0;   // model.time when last lock fired (re-triggered each lock)
    let hanziActive     = false;     // true while a character is being shown
    let hanziStartTime  = 9999.0;    // model.time when current character first appeared
@@ -427,7 +474,9 @@ export const init = async model => {
       this.drawPath([[0, -0.55],   [0, -0.20]]);
       this.drawPath([[0,  0.20],   [0,  0.55]]);
 
-      // Bright center dot (filled)
+      // Bright center dot (filled) — kept small on purpose. A bigger dot
+      // would cover the physical red dot it's supposed to align with,
+      // making fine calibration harder.
       this.setColor([0.7, 1.0, 1.0, 1.0]);
       this.fillOval(-0.08, -0.08, 0.16, 0.16);
    };
@@ -435,43 +484,146 @@ export const init = async model => {
    g2DotIndicator.update();
 
    // ─────────────────────────────────────────────────────────────────────────
-   // SURFACE VFX RENDER (LIDAR scan + persistent perimeter)
+   // TITLE PLAQUE  ("MR-andarin" header)
+   // ─────────────────────────────────────────────────────────────────────────
+   // Static — drawn once at init. Sits above the zone in world space; the
+   // panel matrix is computed from the zone matrix every frame in scene
+   // placement so it stays attached.
+   g2Title.render = function () {
+      const ctx = this.getContext(), canvas = this.getCanvas();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Dark translucent background so the text reads against bright passthrough
+      this.setColor([0.02, 0.05, 0.10, 0.78]);
+      this.fillRect(-1, -1, 2, 2);
+
+      // Cyan border (matches the surface VFX accent color)
+      this.setColor([0.0, 1.0, 0.9, 0.7]);
+      this.lineWidth(0.04);
+      this.drawPath([[-0.97, -0.93], [0.97, -0.93], [0.97, 0.93], [-0.97, 0.93], [-0.97, -0.93]]);
+
+      // Title text. textHeight is in canvas-units where 2.0 = full canvas
+      // height — using values around 0.25–0.4 matches the other info panels
+      // and keeps the text readable rather than gigantic.
+      this.setColor([0.85, 1.0, 1.0, 1.0]);
+      this.textHeight(0.40);
+      this.text('MR-andarin', 0, 0, 'center');
+   };
+   g2Title.update();
+
+   // ─────────────────────────────────────────────────────────────────────────
+   // COURSE-INFO PLAQUE
+   // ─────────────────────────────────────────────────────────────────────────
+   // Static. Sits below the zone. Same chrome as the title plaque.
+   g2CourseInfo.render = function () {
+      const ctx = this.getContext(), canvas = this.getCanvas();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Background
+      this.setColor([0.02, 0.05, 0.10, 0.78]);
+      this.fillRect(-1, -1, 2, 2);
+
+      // Border
+      this.setColor([0.0, 1.0, 0.9, 0.7]);
+      this.lineWidth(0.04);
+      this.drawPath([[-0.97, -0.95], [0.97, -0.95], [0.97, 0.95], [-0.97, 0.95], [-0.97, -0.95]]);
+
+      // Body text (4 lines)
+      const lines = [
+         'Student:    Eros Carrasco',
+         'Course:     CSCI-GA 3033 — Virtual Reality',
+         'Instructor: Kenneth Perlin',
+         'Date:       May 5, 2026',
+      ];
+      this.setColor([0.85, 0.92, 1.0, 1.0]);
+      this.textHeight(0.18);
+      const topY = 0.55, lineSpacing = 0.32;
+      for (let i = 0; i < lines.length; i++) {
+         this.text(lines[i], -0.85, topY - i * lineSpacing, 'left');
+      }
+   };
+   g2CourseInfo.update();
+
+   // ─────────────────────────────────────────────────────────────────────────
+   // SURFACE VFX RENDER
    // ─────────────────────────────────────────────────────────────────────────
    // The G2 canvas spans [-1..1] which maps to the full marker zone (corner
    // ArUcos sit at ±1, ±1 in this canvas's space). All drawing happens in
    // this normalized space.
+   //
+   // Three operating modes, in priority order:
+   //   1. surfaceActive    → LOCKED: full intro animation (scan + "MR-andarin"
+   //                          fade in/out), then persistent perimeter only
+   //   2. surfacePreviewActive (and not surfaceActive) → PREVIEW: just a
+   //                          translucent dashed-feel outline that shows where
+   //                          the zone WILL lock when the trigger fires.
+   //                          Lets the user calibrate fully before committing.
+   //   3. neither           → blank canvas, panel is invisible.
+   //
+   // Intro-animation timeline (relative to surfaceStartTime):
+   //   0.0 – 0.4 s   border fades in to full alpha
+   //                 LIDAR ring expands from center
+   //                 "MR-andarin" text fades in
+   //   0.4 – 1.0 s   text holds at peak
+   //   1.0 – 1.4 s   ring continues until it leaves the canvas
+   //   1.0 – 1.7 s   text fades out
+   //   1.7 s onward  persistent border only
+   const T_TEXT_FADE_IN  = 0.4;
+   const T_TEXT_HOLD_END = 1.0;
+   const T_TEXT_FADE_OUT_DUR = 0.7;
    g2Surface.render = function () {
       const ctx = this.getContext(), canvas = this.getCanvas();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // ── PREVIEW MODE (no lock yet, but 4 dots tracked) ─────────────────────
+      // Draw a tinted fill between the 4 corners so the user can SEE the
+      // calibration plane in 3D as a solid surface, not 4 floating reticles.
+      // If the fill sits ON the whiteboard, ZONE_SIDE is right; if it floats
+      // in front of or behind the wall, , / . to fix.
+      //
+      // Alpha tuned for depth perception: too transparent and the plane
+      // disappears against busy passthrough; too opaque and it occludes the
+      // physical dots you're trying to align with. ~0.35 is the sweet spot.
+      if (surfacePreviewActive && !surfaceActive) {
+         this.setColor([0.0, 0.85, 0.95, 0.35]);
+         this.fillRect(-0.96, -0.96, 1.92, 1.92);
+         // Bright solid perimeter on top so the plane edges read clearly.
+         this.setColor([0.0, 1.0, 0.95, 0.85]);
+         this.lineWidth(0.03);
+         this.drawPath([[-0.96, -0.96], [0.96, -0.96], [0.96, 0.96], [-0.96, 0.96], [-0.96, -0.96]]);
+         return;
+      }
+
       if (!surfaceActive) return;
 
       const t = model.time - surfaceStartTime;
       if (t < 0) return;
 
-      // Persistent perimeter — fades in linearly to alpha 0.5, stays there forever
-      const borderAlpha = Math.min(0.5, t * 0.5);
+      // ── Persistent perimeter ──────────────────────────────────────────────
+      // Brighter than the preview outline. Fades in fast and stays forever.
+      const borderAlpha = Math.min(0.85, t * 2.5);
       this.setColor([0.0, 1.0, 0.9, borderAlpha]);
-      this.lineWidth(0.015);
-      this.drawPath([[-0.98, -0.98], [0.98, -0.98], [0.98, 0.98], [-0.98, 0.98], [-0.98, -0.98]]);
+      this.lineWidth(0.022);
+      this.drawPath([[-0.96, -0.96], [0.96, -0.96], [0.96, 0.96], [-0.96, 0.96], [-0.96, -0.96]]);
 
-      // Initial LIDAR scan — only during the first T_SURFACE_SCAN seconds after lock
+      // ── LIDAR scan ────────────────────────────────────────────────────────
       if (t <= T_SURFACE_SCAN) {
          let pulseAlpha = 1.0;
-         if (t > 1.0) pulseAlpha = 1.0 - ((t - 1.0) * 2.0);
+         if (t > 1.0) pulseAlpha = Math.max(0, 1.0 - ((t - 1.0) * 2.0));
 
          const maxRadius    = t * 2.8;
          const waveGlowSize = 0.4;
 
          // Cross-pattern dots that light up as the wave passes through
          const step = 0.15, crossSize = 0.015;
-         this.lineWidth(0.008);
+         this.lineWidth(0.01);
          for (let x = -0.9; x <= 0.9; x += step) {
             for (let y = -0.9; y <= 0.9; y += step) {
                const dist = Math.sqrt(x * x + y * y);
                const distanceToWave = maxRadius - dist;
                if (distanceToWave > 0 && distanceToWave < waveGlowSize) {
                   const dotAlpha = (1.0 - (distanceToWave / waveGlowSize)) * pulseAlpha;
-                  this.setColor([0.0, 1.0, 0.9, dotAlpha * 0.7]);
+                  this.setColor([0.4, 1.0, 1.0, dotAlpha * 0.9]);
                   this.drawPath([[x - crossSize, y], [x + crossSize, y]]);
                   this.drawPath([[x, y - crossSize], [x, y + crossSize]]);
                }
@@ -479,9 +631,33 @@ export const init = async model => {
          }
 
          // Expanding ring
-         this.setColor([0.0, 1.0, 0.9, 0.5 * pulseAlpha]);
-         this.lineWidth(0.02);
+         this.setColor([0.0, 1.0, 0.9, 0.7 * pulseAlpha]);
+         this.lineWidth(0.025);
          this.drawOval(-maxRadius, -maxRadius, maxRadius * 2, maxRadius * 2);
+      }
+
+      // ── "MR-andarin" centered intro text — fades in, holds, fades out ─────
+      const textTotalDur = T_TEXT_HOLD_END + T_TEXT_FADE_OUT_DUR;
+      if (t <= textTotalDur) {
+         let textAlpha;
+         if (t < T_TEXT_FADE_IN) {
+            textAlpha = t / T_TEXT_FADE_IN;          // ease-in (linear is fine)
+         } else if (t < T_TEXT_HOLD_END) {
+            textAlpha = 1.0;                         // hold at peak
+         } else {
+            textAlpha = 1.0 - (t - T_TEXT_HOLD_END) / T_TEXT_FADE_OUT_DUR;
+         }
+         textAlpha = Math.max(0, Math.min(1, textAlpha));
+
+         // Soft glow halo behind the text
+         this.setColor([0.0, 1.0, 0.9, textAlpha * 0.4]);
+         this.textHeight(0.55);
+         this.text('MR-andarin', 0, 0, 'center');
+
+         // Bright main text on top
+         this.setColor([0.85, 1.0, 1.0, textAlpha]);
+         this.textHeight(0.5);
+         this.text('MR-andarin', 0, 0, 'center');
       }
    };
 
@@ -599,14 +775,32 @@ export const init = async model => {
       hanziActive = false;
    }
 
-   // ── Manual lock trigger (headset controller button) ───────────────────────
-   // Fires on whichever client receives the input — typically the headset,
-   // since that's where the controllers are. Bumps lockCounter and broadcasts
-   // so the PC Master can pick it up via synchronize at the top of animate.
+   // ── Manual lock trigger (controller trigger button) ──────────────────────
+   // Fires on whichever client receives the input — typically the headset.
+   // Bumps lockCounter and broadcasts so the PC Master picks it up via
+   // synchronize at the top of animate().
+   //
+   // **Why we gate on !window.handtracking:**
+   // clay's `inputEvents.onPress` fires on `L0_press` / `R0_press`, which the
+   // runtime treats as the same event whether it came from the controller's
+   // index-finger trigger OR from a thumb-to-index pinch gesture in
+   // hand-tracking mode. That means simply moving your head with your fingers
+   // anywhere near each other accidentally registers as a "trigger press" and
+   // accumulates lockCounter without any conscious action — which is what was
+   // making the zone lock spontaneously.
+   //
+   // Since the intent is "lock with the controller trigger, deliberately",
+   // we ignore presses while in hand-tracking mode entirely. If the user puts
+   // down the controllers (the runtime auto-switches to hand-tracking per the
+   // API docs), they'll need to pick the controllers back up to lock.
    inputEvents.onPress = hand => {
+      if (window.handtracking) {
+         console.log('[MRandarin] press ignored (hand-tracking mode — pinch gestures must not lock the zone). Use the controller trigger.');
+         return;
+      }
       mandarinState.lockCounter = (mandarinState.lockCounter || 0) + 1;
       server.broadcastGlobal('mandarinState');
-      console.log('[MRandarin] lock pressed (' + hand + ')');
+      console.log('[MRandarin] lock pressed (' + hand + ') → counter=' + mandarinState.lockCounter);
    };
 
    // ── MASTER CLIENT (PC) ONLY ──────────────────────────────────────────────
@@ -804,6 +998,32 @@ export const init = async model => {
          console.log('[MRandarin] SQUARE_FL = ' + next.toFixed(3) +
                      '   (≈ ' + fov + '° H FOV)');
       });
+
+      // ── ZONE_SIDE tuner ( , / . )  ────────────────────────────────────────
+      // Live calibration of the physical side of the dot square. Works the
+      // same way as SQUARE_FL — published via mandarinState.zoneSide, picked
+      // up by both clients in animate().
+      //
+      // Workflow: AFTER calibrating SQUARE_FL (so reticles align in 2D), tap
+      // , or . to adjust ZONE_SIDE. The reticles will move IN/OUT in 3D
+      // along the rays from the headset to the dots. Stop when they sit
+      // ON the surface of your whiteboard.
+      //
+      //   "."  → bigger square assumed → recovered depth FARTHER from you
+      //   ","  → smaller square assumed → recovered depth CLOSER to you
+      window.addEventListener('keydown', (e) => {
+         if (e.key !== ',' && e.key !== '.') return;
+         const sign = (e.key === '.') ? +1 : -1;
+         const next = Math.max(
+            ZONE_SIDE_MIN,
+            Math.min(ZONE_SIDE_MAX, ZONE_SIDE + sign * ZONE_SIDE_STEP)
+         );
+         ZONE_SIDE = next;
+         mandarinState.zoneSide = next;
+         server.broadcastGlobal('mandarinState');
+         console.log('[MRandarin] ZONE_SIDE = ' + next.toFixed(3) + ' m  (' +
+                     (next * 100).toFixed(0) + ' cm)');
+      });
    }
 
    // ── ALL CLIENTS ───────────────────────────────────────────────────────────
@@ -812,8 +1032,13 @@ export const init = async model => {
    let lastViewMatrix = null;
    let localPanelMatrix = null;       // recomputed when a new character is detected (uses LOCAL viewMatrix)
    let activeZone = null;             // { matrix, halfX, halfY } captured ONCE on first valid srcCorners; persists through erase
-   let lastResetCounter = 0;
-   let lastLockCounter  = 0;
+   // Reset/lock counters: initialize from whatever the server already has so
+   // we don't replay stale events on first animate. If lockCounter is at e.g.
+   // 9 from a previous session and we initialized to 0, the > comparison would
+   // fire instantly on frame one and lock without any controller press —
+   // which is exactly the "ArUcos appear without pressing the trigger" bug.
+   let lastResetCounter = (typeof mandarinState.resetCounter === 'number') ? mandarinState.resetCounter : 0;
+   let lastLockCounter  = (typeof mandarinState.lockCounter  === 'number') ? mandarinState.lockCounter  : 0;
    let lastFrameTime    = 0;          // for joystick dt
 
    // Build a square→model-space pose from the four image-space corners returned
@@ -822,14 +1047,25 @@ export const init = async model => {
    //
    // Returns { matrix, halfExtent } or null:
    //   matrix     — 4×4 column-major, basis vectors are UNIT, translation in meters
-   //   halfExtent — meters from zone center to a corner along an axis. The
-   //                initial zone is a square; the joystick may later stretch it
-   //                non-uniformly (handled outside this fn via halfX/halfY).
+   //   halfExtent — meters from zone center to a corner along an axis. Equal to
+   //                ZONE_SIDE / 2 — i.e. the user-supplied physical half-side of
+   //                the dot square. The joystick may later stretch the zone
+   //                non-uniformly (halfX/halfY); halfExtent is the symmetric
+   //                starting value at lock time.
    //
-   // The depth is FORCED to QUEST_FOCAL_DISTANCE — see the long comment near
-   // the constants for why. Net effect: regardless of how big the physical red
-   // dot pattern actually is, the four ArUco holograms project onto the four
-   // red dots in the cast image, and sit at 1.3 m depth along the camera ray.
+   // PHYSICAL-SCALE PnP. The third argument to computeCameraPose is the model
+   // square's side length in METERS — i.e. how far apart your physical red dots
+   // are in the real world. Passing the true distance here produces a metrically
+   // correct camera-space pose: the recovered translation magnitude IS the
+   // distance from the headset to the dot plane, in meters.
+   //
+   // (The previous version of this code passed an arbitrary side length and
+   // then forced the recovered depth to QUEST_FOCAL_DISTANCE = 1.3 m along the
+   // camera ray. That worked image-space — the ArUcos still projected onto the
+   // red dots — but only landed on the actual whiteboard if the user happened
+   // to be standing exactly 1.3 m away. Closer than that and the zone ended up
+   // deep behind the wall; farther and it floated in front. Trusting the PnP
+   // depth removes that constraint as long as ZONE_SIDE is calibrated correctly.)
    function computeLocalPanelMatrix(srcCorners, frameW, frameH) {
       if (!srcCorners || !frameW || !frameH) return null;
 
@@ -843,35 +1079,19 @@ export const init = async model => {
          C.push(-(v - 0.5) * aspect);   // image y is down; flip + aspect-correct
       }
 
-      // SOLVE_SIZE is arbitrary — the depth-anchoring step below cancels its
-      // effect on the final pose. Using 1.0 keeps the math readable.
-      const squareToCameraCV = computeCameraPose(C, SQUARE_FL, SOLVE_SIZE);
+      // ZONE_SIDE is the real-world side of the dot square in meters. PnP
+      // recovers the camera-space pose at that scale.
+      const squareToCameraCV = computeCameraPose(C, SQUARE_FL, ZONE_SIDE);
       // CV convention (camera looks +z) → GL/WebXR convention (camera looks -z).
       const flipZ = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1];
       const squareToCamera = mxm(flipZ, squareToCameraCV);
 
-      // ── DEPTH ANCHORING ──────────────────────────────────────────────────
-      // Recovered translation magnitude is in SOLVE_SIZE units, scaled by the
-      // (unknown) ratio between SOLVE_SIZE and the real-world spacing. We
-      // compute that magnitude and scale everything so the zone center sits
-      // at exactly QUEST_FOCAL_DISTANCE along the camera ray.
-      //
-      // Scaling translation uniformly preserves the camera-space projections
-      // of the four model corners (a model point M_i maps to image pixel f *
-      // R*M_i / (R*M_i + t)·ẑ, and uniformly scaling t while ALSO uniformly
-      // scaling M_i — which is what halfExtent does — preserves the ratio,
-      // so projections are fixed). That's why ArUcos lock onto the red dots.
-      const tx = squareToCamera[12];
-      const ty = squareToCamera[13];
+      // Sanity-check the recovered translation. A finite, in-front-of-camera
+      // depth (negative z in GL convention, since camera looks -z) is required.
       const tz = squareToCamera[14];
-      const currentDepth = Math.sqrt(tx*tx + ty*ty + tz*tz);
-      if (!isFinite(currentDepth) || currentDepth <= 1e-6) return null;
-      const scale = QUEST_FOCAL_DISTANCE / currentDepth;
-      squareToCamera[12] = tx * scale;
-      squareToCamera[13] = ty * scale;
-      squareToCamera[14] = tz * scale;
-      const halfExtent = (SOLVE_SIZE / 2) * scale;
-      // ─────────────────────────────────────────────────────────────────────
+      if (!isFinite(tz) || tz === 0) return null;
+
+      const halfExtent = ZONE_SIDE / 2;
 
       // Use THIS client's current camera→world transform.
       const captureView = clay.root().inverseViewMatrix(0);
@@ -935,14 +1155,19 @@ export const init = async model => {
          server.broadcastGlobal('mandarinState');
       }
 
-      // ── FL sync (all clients) ──────────────────────────────────────────────
-      // The PC's [ / ] keys mutate mandarinState.squareFL and broadcast. Pick
-      // it up here on every frame so the headset's ray-casts use the same FL
-      // as the PC. If the PC hasn't published one yet, keep our own default.
+      // ── FL & ZONE_SIDE sync (all clients) ──────────────────────────────────
+      // The PC's [ / ] and , / . keys mutate mandarinState.squareFL and
+      // mandarinState.zoneSide and broadcast. Pick them up here on every frame
+      // so the headset uses the same calibration as the PC.
       if (typeof mandarinState.squareFL === 'number' &&
           isFinite(mandarinState.squareFL) &&
           mandarinState.squareFL > 0) {
          SQUARE_FL = mandarinState.squareFL;
+      }
+      if (typeof mandarinState.zoneSide === 'number' &&
+          isFinite(mandarinState.zoneSide) &&
+          mandarinState.zoneSide > 0) {
+         ZONE_SIDE = mandarinState.zoneSide;
       }
 
       // Keep the latest view matrix around for diagnostics.
@@ -958,18 +1183,21 @@ export const init = async model => {
       const currentResetCounter = mandarinState.resetCounter || 0;
       if (currentResetCounter !== lastResetCounter) {
          lastResetCounter = currentResetCounter;
-         activeZone     = null;
-         surfaceActive  = false;        // wipe the surface VFX too
-         hanziActive    = false;
+         activeZone           = null;
+         surfaceActive        = false;        // wipe the surface VFX too
+         surfacePreviewActive = false;        // and the preview ghost
+         hanziActive          = false;
          hidePanels();
-         // Indicators are repositioned per-frame from srcCorners, but if the
-         // reset clears srcCorners on the PC and the headset hasn't received
-         // the fresh state yet, the indicators could briefly show stale poses.
-         // Hide them explicitly so the visual reset is instantaneous.
+         // Indicators and plaques are repositioned per-frame from srcCorners,
+         // but if the reset clears srcCorners on the PC and the headset hasn't
+         // received the fresh state yet, they could briefly show stale poses.
+         // Hide explicitly so the visual reset is instantaneous.
          dotInd0.setMatrix(HIDDEN_MATRIX);
          dotInd1.setMatrix(HIDDEN_MATRIX);
          dotInd2.setMatrix(HIDDEN_MATRIX);
          dotInd3.setMatrix(HIDDEN_MATRIX);
+         panelTitle.setMatrix(HIDDEN_MATRIX);
+         panelCourseInfo.setMatrix(HIDDEN_MATRIX);
       }
 
       // ── Lock signal — capture activeZone (all clients) + switch backend (PC only) ──
@@ -1114,46 +1342,80 @@ export const init = async model => {
 
       // ─────────────────────────────────────────────────────────────────────
       // SCENE PLACEMENT — three modes:
-      //   1. LOCKED (activeZone set): ArUcos + surface VFX at the captured
-      //      zone. Per-dot indicators hidden — their job is done, and after
-      //      lock srcCorners no longer represents red dots (the backend has
-      //      switched to TRACKING_ARUCO and is now reporting ArUco hologram
-      //      positions instead, which would be confusing to display as "red
-      //      dot detected" markers).
-      //   2. PREVIEW (no zone yet, srcCorners fresh): four cyan reticles, one
-      //      per detected red dot, each placed at QUEST_FOCAL_DISTANCE on its
-      //      OWN camera ray and recomputed every frame. Because each indicator
-      //      is computed independently from a single (u,v) plus the LIVE view
-      //      matrix, it always projects exactly onto its red dot in the cast,
-      //      regardless of whether the user has moved their head since the
-      //      backend last published. This is the visual feedback for
-      //      "we see your dot" — if the reticles aren't ON the physical dots,
-      //      the SQUARE_FL constant is wrong, not the depth.
+      //   1. LOCKED (activeZone set): full intro VFX, ArUcos, plaques. Per-dot
+      //      reticles hidden — once locked, srcCorners switches to ArUco
+      //      tracking and would be confusing to display as red-dot markers.
+      //   2. PREVIEW (no zone yet, srcCorners fresh): translucent ghost of the
+      //      eventual zone — surface outline + title plaque + course plaque +
+      //      4 cyan reticles, ALL positioned via the LIVE PnP matrix that
+      //      tracks the dots every frame. Lets the user calibrate SQUARE_FL
+      //      and ZONE_SIDE while seeing the full layout, before committing
+      //      with the trigger:
+      //         reticles drift in 2D  → SQUARE_FL wrong  → tune with [ / ]
+      //         reticles aligned in 2D but at wrong 3D depth (in front of /
+      //                                  behind the wall)
+      //                               → ZONE_SIDE wrong → tune with , / .
       //   3. NONE (no detection): everything hidden.
+      //
+      // ArUcos and plaques are lifted forward by ARUCO_Z_LIFT along the zone's
+      // local +Z axis (toward the viewer). Without that, they fight the
+      // surface VFX in the depth buffer and the surface VFX can briefly
+      // occlude the ArUcos — bad for OpenCV's track.
       // ─────────────────────────────────────────────────────────────────────
+
+      // The intro animation runs from surfaceStartTime for T_INTRO_TOTAL
+      // seconds (LIDAR scan + "MR-andarin" text fade). Plaques (title,
+      // course info) only enter AFTER the intro is done — bringing them in
+      // earlier competes with the intro for attention and clutters a phase
+      // where the user is just confirming "yes, the zone is in the right
+      // place". They also stay hidden during PREVIEW for the same reason:
+      // calibration is about lining up the plane, not reading metadata.
+      const T_INTRO_TOTAL = T_TEXT_HOLD_END + T_TEXT_FADE_OUT_DUR;   // ≈1.7 s
+
+      // Local helper: position the side plaques using a zone matrix + half-sizes.
+      // Used only in LOCKED, after the intro animation completes.
+      const placePlaques = (Mz, hX, hY) => {
+         const zL = ARUCO_Z_LIFT;
+         // Title above the top edge
+         const titleY = hY + PLAQUE_GAP + TITLE_HALF_H;
+         placePanelAt(panelTitle,
+                      transform(Mz, [0, titleY, zL]),
+                      Mz, TITLE_HALF_W, TITLE_HALF_H);
+         // Course-info below the bottom edge
+         const courseY = -hY - PLAQUE_GAP - COURSE_HALF_H;
+         placePanelAt(panelCourseInfo,
+                      transform(Mz, [0, courseY, zL]),
+                      Mz, COURSE_HALF_W, COURSE_HALF_H);
+      };
+
       if (activeZone) {
          const Mz = activeZone.matrix;
          const hX = activeZone.halfX;
          const hY = activeZone.halfY;
 
-         // ── Surface VFX panel: covers the entire zone, coplanar ────────────
+         // We're past PREVIEW — turn its ghost outline off; the surface canvas
+         // is now driven by the lock-time intro animation.
+         surfacePreviewActive = false;
+
+         // Surface VFX panel: covers the entire zone, coplanar with the wall
          const zoneCenter = transform(Mz, [0, 0, 0]);
          placePanelAt(surfaceObj, zoneCenter, Mz, hX, hY);
 
-         // ── ArUco hologram panels at the 4 corners ─────────────────────────
-         // At lock time hX === hY === halfExtent, so each ArUco sits exactly
-         // on its red dot — viewed from the lock-time camera position. As the
-         // user moves AWAY from that pose some parallax appears (this is the
-         // cost of single-image depth anchoring), but at typical reading
-         // distance (~1.3 m from the whiteboard) it stays acceptably tight.
-         const aTL = transform(Mz, [-hX,  hY, 0]);
-         const aTR = transform(Mz, [ hX,  hY, 0]);
-         const aBR = transform(Mz, [ hX, -hY, 0]);
-         const aBL = transform(Mz, [-hX, -hY, 0]);
-         placePanelAt(arucoTL, aTL, Mz, ARUCO_SIZE);
-         placePanelAt(arucoTR, aTR, Mz, ARUCO_SIZE);
-         placePanelAt(arucoBR, aBR, Mz, ARUCO_SIZE);
-         placePanelAt(arucoBL, aBL, Mz, ARUCO_SIZE);
+         // ArUco hologram panels at the 4 corners — z-lifted forward
+         const zL = ARUCO_Z_LIFT;
+         placePanelAt(arucoTL, transform(Mz, [-hX,  hY, zL]), Mz, ARUCO_SIZE);
+         placePanelAt(arucoTR, transform(Mz, [ hX,  hY, zL]), Mz, ARUCO_SIZE);
+         placePanelAt(arucoBR, transform(Mz, [ hX, -hY, zL]), Mz, ARUCO_SIZE);
+         placePanelAt(arucoBL, transform(Mz, [-hX, -hY, zL]), Mz, ARUCO_SIZE);
+
+         // Plaques wait for the intro to finish, then appear.
+         const introT = surfaceActive ? (model.time - surfaceStartTime) : Infinity;
+         if (introT >= T_INTRO_TOTAL) {
+            placePlaques(Mz, hX, hY);
+         } else {
+            panelTitle.setMatrix(HIDDEN_MATRIX);
+            panelCourseInfo.setMatrix(HIDDEN_MATRIX);
+         }
 
          // Hide per-dot indicators — they belong to the pre-lock phase only.
          dotInd0.setMatrix(HIDDEN_MATRIX);
@@ -1161,84 +1423,78 @@ export const init = async model => {
          dotInd2.setMatrix(HIDDEN_MATRIX);
          dotInd3.setMatrix(HIDDEN_MATRIX);
       } else if (mandarinState.srcCorners && mandarinState.frameW && mandarinState.frameH) {
-         // PREVIEW MODE — show one cyan reticle per detected red dot. Each
-         // reticle is independent; we don't run the full 4-point homography
-         // here, we just ray-cast each dot's image position out to
-         // QUEST_FOCAL_DISTANCE. That has two important properties:
-         //
-         //   • Per-frame projection is exact. The reticle for dot i is
-         //     guaranteed to land on dot i's image position from the CURRENT
-         //     view matrix, because dir_world = inverseView · (xn, yn, -fl)
-         //     and we're rendering with that same view → projection cancels.
-         //
-         //   • No plane-fit error. The full homography assumes the 4 dots are
-         //     coplanar in world space; any noise in srcCorners pushes the
-         //     plane around. Reticles don't share a plane, so each one is
-         //     immune to the others' detection noise.
-         //
-         // What the user sees: 4 cyan crosshairs landing exactly on the 4 red
-         // dots. If they DON'T land, the camera FOV constant SQUARE_FL is off.
-         //
-         // Surface VFX & ArUcos stay hidden until lock.
-         surfaceObj.setMatrix(HIDDEN_MATRIX);
+         // PREVIEW — recompute the live PnP zone every frame and lay out the
+         // calibration view. This phase is INTENTIONALLY MINIMAL: tinted
+         // square between the 4 reticles + the reticles themselves. No plaques,
+         // no chrome — the user is calibrating, not reading.
+         const previewPose = computeLocalPanelMatrix(
+            mandarinState.srcCorners, mandarinState.frameW, mandarinState.frameH
+         );
+
+         // ArUco textures stay hidden in preview — the cyan reticles take
+         // their place at the same 4 corner positions.
          arucoTL.setMatrix(HIDDEN_MATRIX);
          arucoTR.setMatrix(HIDDEN_MATRIX);
          arucoBR.setMatrix(HIDDEN_MATRIX);
          arucoBL.setMatrix(HIDDEN_MATRIX);
+         // Plaques never show in preview.
+         panelTitle.setMatrix(HIDDEN_MATRIX);
+         panelCourseInfo.setMatrix(HIDDEN_MATRIX);
 
-         const indicators = [dotInd0, dotInd1, dotInd2, dotInd3];
-         const inv = clay.root().inverseViewMatrix(0);
-         // Camera basis in world space (columns of inverseView).
-         const cRight = [inv[0], inv[1], inv[2]];
-         const cUp    = [inv[4], inv[5], inv[6]];
-         const cBack  = [inv[8], inv[9], inv[10]];   // = -forward
-         const headPos = [inv[12], inv[13], inv[14]];
-         const aspect = mandarinState.frameH / mandarinState.frameW;
+         if (!previewPose) {
+            // PnP failed (degenerate quad, NaN, …). Hide all preview visuals
+            // until detection recovers.
+            surfacePreviewActive = false;
+            surfaceObj.setMatrix(HIDDEN_MATRIX);
+            dotInd0.setMatrix(HIDDEN_MATRIX);
+            dotInd1.setMatrix(HIDDEN_MATRIX);
+            dotInd2.setMatrix(HIDDEN_MATRIX);
+            dotInd3.setMatrix(HIDDEN_MATRIX);
+         } else {
+            const Mz = previewPose.matrix;
+            const h  = previewPose.halfExtent;
 
-         for (let i = 0; i < 4; i++) {
-            const corner = mandarinState.srcCorners[i];
-            if (!corner) {
-               indicators[i].setMatrix(HIDDEN_MATRIX);
-               continue;
-            }
-            const u = corner[0];
-            const v = corner[1];
+            // Tinted-fill square between the 4 corners — surface canvas is
+            // in PREVIEW mode and draws the fill that visualizes the plane.
+            surfacePreviewActive = true;
+            const zoneCenter = transform(Mz, [0, 0, 0]);
+            placePanelAt(surfaceObj, zoneCenter, Mz, h, h);
 
-            // Camera-space ray (GL convention: camera looks -z).
-            //   xn = u - 0.5            in [-0.5, +0.5] horizontally
-            //   yn = -(v - 0.5)*aspect  flip image-y, scale to match xn units
-            //   zn = -SQUARE_FL         pointing forward (down -z)
-            const xn = u - 0.5;
-            const yn = -(v - 0.5) * aspect;
-            const zn = -SQUARE_FL;
-            const len = Math.sqrt(xn*xn + yn*yn + zn*zn);
-            if (!isFinite(len) || len < 1e-6) {
-               indicators[i].setMatrix(HIDDEN_MATRIX);
-               continue;
-            }
-            // Camera-space point at exactly QUEST_FOCAL_DISTANCE along the ray.
-            const k = QUEST_FOCAL_DISTANCE / len;
-            const cx = xn * k;
-            const cy = yn * k;
-            const cz = zn * k;
-            // Camera → world: P_w = headPos + cRight*cx + cUp*cy + cBack*cz
-            const wx = headPos[0] + cRight[0]*cx + cUp[0]*cy + cBack[0]*cz;
-            const wy = headPos[1] + cRight[1]*cx + cUp[1]*cy + cBack[1]*cz;
-            const wz = headPos[2] + cRight[2]*cx + cUp[2]*cy + cBack[2]*cz;
-
-            // Billboard the reticle: its X axis = cRight, Y axis = cUp, scaled
-            // to DOT_INDICATOR_HALF (half of the panel's [-1..1] extent → 8 cm).
+            // 4 cyan reticles billboard toward the camera at the 4 corners.
+            // Same corner order as the locked branch (TL, TR, BR, BL).
+            const corners = [
+               transform(Mz, [-h,  h, 0]),
+               transform(Mz, [ h,  h, 0]),
+               transform(Mz, [ h, -h, 0]),
+               transform(Mz, [-h, -h, 0]),
+            ];
+            const inv     = clay.root().inverseViewMatrix(0);
+            const cRight  = [inv[0], inv[1], inv[2]];
+            const cUp     = [inv[4], inv[5], inv[6]];
+            const cBack   = [inv[8], inv[9], inv[10]];
+            const indicators = [dotInd0, dotInd1, dotInd2, dotInd3];
             const s = DOT_INDICATOR_HALF;
-            indicators[i].setMatrix([
-               cRight[0] * s, cRight[1] * s, cRight[2] * s, 0,
-               cUp[0]    * s, cUp[1]    * s, cUp[2]    * s, 0,
-               cBack[0],      cBack[1],      cBack[2],      0,
-               wx,            wy,            wz,            1,
-            ]);
+
+            for (let i = 0; i < 4; i++) {
+               const p = corners[i];
+               if (!p || !isFinite(p[0]) || !isFinite(p[1]) || !isFinite(p[2])) {
+                  indicators[i].setMatrix(HIDDEN_MATRIX);
+                  continue;
+               }
+               indicators[i].setMatrix([
+                  cRight[0] * s, cRight[1] * s, cRight[2] * s, 0,
+                  cUp[0]    * s, cUp[1]    * s, cUp[2]    * s, 0,
+                  cBack[0],      cBack[1],      cBack[2],      0,
+                  p[0],          p[1],          p[2],          1,
+               ]);
+            }
          }
       } else {
          // No zone, no corners — hide everything.
+         surfacePreviewActive = false;
          surfaceObj.setMatrix(HIDDEN_MATRIX);
+         panelTitle.setMatrix(HIDDEN_MATRIX);
+         panelCourseInfo.setMatrix(HIDDEN_MATRIX);
          arucoTL.setMatrix(HIDDEN_MATRIX);
          arucoTR.setMatrix(HIDDEN_MATRIX);
          arucoBR.setMatrix(HIDDEN_MATRIX);
@@ -1341,6 +1597,9 @@ export const init = async model => {
             'SQUARE_FL: ' + SQUARE_FL.toFixed(3) +
                '   (≈ ' + (2 * Math.atan(0.5 / SQUARE_FL) * 180 / Math.PI).toFixed(1) + '° H-FOV)',
             '   tune live with  [   and   ]   keys',
+            '',
+            'ZONE_SIDE: ' + ZONE_SIDE.toFixed(3) + ' m   (' + (ZONE_SIDE * 100).toFixed(0) + ' cm)',
+            '   tune live with  ,   and   .   keys',
             '',
             'lockCounter:  ' + (mandarinState.lockCounter  || 0),
             'resetCounter: ' + (mandarinState.resetCounter || 0),
