@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from PIL import Image, ImageDraw, ImageFont
 
 from vision_tracker import (
     detect_markers,
@@ -19,6 +20,7 @@ from vision_tracker import (
     is_valid_quad,
     check_if_erased,
     bgr_to_png_bytes,
+    ERASE_HALF_PX,
 )
 
 from vision_ocr import (
@@ -32,6 +34,47 @@ CORS(app)
 
 # Suppress Flask's per-request access log — only show errors
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
+# ── CJK-capable font for the debug view ────────────────────────────────────
+# OpenCV's putText only ships with Hershey fonts, none of which include CJK
+# glyphs. Without a TrueType font, recognized hanzi render as "???" in the
+# /debug page — useless when the whole point is to verify which character
+# Vision saw. We use PIL with a system CJK font instead. The path list
+# covers macOS first (most likely host), then common Linux installs;
+# whichever exists wins. If none are found we fall back to PIL's default
+# bitmap font, which still won't render CJK but at least won't crash.
+_CJK_FONT_PATHS = [
+    '/System/Library/Fonts/PingFang.ttc',                     # macOS, modern
+    '/System/Library/Fonts/STHeiti Medium.ttc',               # macOS, older
+    '/System/Library/Fonts/Hiragino Sans GB.ttc',             # macOS, alt
+    '/Library/Fonts/Arial Unicode.ttf',                       # macOS, broad coverage
+    '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', # Linux, Debian/Ubuntu
+    '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',         # Linux, alt
+]
+
+def _get_cjk_font(size):
+    for path in _CJK_FONT_PATHS:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+def _draw_text_with_cjk(bgr_image, text, position, font_size=36, bgr_color=(0, 220, 255)):
+    """Draw text on a BGR numpy image using PIL — for CJK glyph support.
+
+    `position` is (x, y) of the top-left of the text in pixel coords.
+    `bgr_color` is in OpenCV BGR convention; PIL needs RGB so we flip.
+    Returns a new BGR image with the text rendered onto it.
+    """
+    rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(rgb)
+    draw = ImageDraw.Draw(pil_img)
+    font = _get_cjk_font(font_size)
+    pil_color = (bgr_color[2], bgr_color[1], bgr_color[0])
+    draw.text(position, text, fill=pil_color, font=font)
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 # Confidence threshold below which Apple Vision OCR results are discarded.
 # Lowered from 0.5 to 0.3 because handwritten hanzi on a whiteboard rarely
@@ -104,6 +147,17 @@ _debug_state = {
     'timestamp': None,
     'locked': False,
     'locked_bbox': None,  # (x, y, w, h) pixel coords of locked character
+    # Last OCR pass — what Vision returned and why each candidate was
+    # accepted or rejected. Surfaced in /debug so the user can see whether
+    # the character they wrote was even a candidate.
+    'last_observations': [],  # [{'candidates': [{'text','confidence'}, ...]}]
+    'last_rejections':  [],   # [{'text','char'?,'confidence','reason'}]
+    # Pixel bbox of the most recent ACCEPTED character — drawn on the
+    # /debug image as a yellow rectangle so the user can see WHERE Vision
+    # thinks it found the character. Distinct from locked_bbox which only
+    # gets set on a successful lock; this one is set every time OCR
+    # accepts something (and stays set until reset/erase).
+    'last_accepted_bbox': None,
 }
 
 def _src_corners_payload(centroids, img_w, img_h):
@@ -232,13 +286,52 @@ def predict():
         # observations and pick the first one that:
         #   1. contains at least one Chinese character (\u4e00..\u9fff)
         #   2. has confidence ≥ OCR_CONFIDENCE_THRESHOLD
+        #   3. its bbox is NOT inside the corner-erase zones (where ArUcos
+        #      were wiped — anything Vision finds there is by definition
+        #      garbage, since we just painted those regions pure white).
         # This is more permissive than the old "only check candidate #1" loop
         # — Vision's #1 pick on handwritten hanzi is sometimes a digit or a
         # Latin letter while #2 / #3 is the correct character.
-        accepted = None  # (char, confidence, bb)
+        #
+        # Pre-compute the four corners of the warped 800×800 zone in pixel
+        # coords so we can check candidate bboxes against them. The "danger
+        # radius" is ERASE_HALF_PX + a small slop — anything closer than
+        # this to a corner is overwhelmingly likely to be an ArUco residue.
+        zone_left = img_w / 2 - 400
+        zone_top  = img_h / 2 - 400
+        zone_right = zone_left + 800
+        zone_bottom = zone_top + 800
+        warped_corners = [
+            (zone_left,  zone_top),
+            (zone_right, zone_top),
+            (zone_right, zone_bottom),
+            (zone_left,  zone_bottom),
+        ]
+        BBOX_CORNER_DANGER = ERASE_HALF_PX + 20  # pixels — slop on top of the erase
+
+        accepted = None  # (char, confidence, bb, bbox_pixels)
         rejection_reasons = []  # for the session log
         for obs in ocr_results:
             bb = obs['bb']
+            # Convert this observation's bbox to pixel coords once — used
+            # both for the corner-distance check and (if accepted) the
+            # final response payload.
+            bx = int(bb.origin.x * img_w)
+            by = int((1 - bb.origin.y - bb.size.height) * img_h)
+            bw = int(bb.size.width * img_w)
+            bh = int(bb.size.height * img_h)
+            bbox_center = (bx + bw / 2, by + bh / 2)
+
+            # Distance from bbox center to nearest warped corner. If the bbox
+            # center sits inside any of the four corner-erase regions, this
+            # observation is the OCR latching onto leftover marker pixels
+            # rather than the user's actual hanzi.
+            min_corner_d = min(
+                max(abs(bbox_center[0] - cx_c), abs(bbox_center[1] - cy_c))
+                for (cx_c, cy_c) in warped_corners
+            )
+            in_corner = min_corner_d < BBOX_CORNER_DANGER
+
             for (text, confidence) in obs['candidates']:
                 if not is_chinese(text):
                     rejection_reasons.append({
@@ -265,10 +358,29 @@ def predict():
                         'reason': f'below_threshold_{OCR_CONFIDENCE_THRESHOLD}',
                     })
                     continue
-                accepted = (char, float(confidence), bb)
+                if in_corner:
+                    # Bbox center sits in a corner-erase region. Almost
+                    # certainly an ArUco residue, not a real hanzi.
+                    print(f'Rejected {char} ({confidence:.2f}): bbox in corner zone')
+                    rejection_reasons.append({
+                        'text': text,
+                        'char': char,
+                        'confidence': round(float(confidence), 3),
+                        'reason': 'bbox_in_corner_erase_zone',
+                        'bbox_center': [round(bbox_center[0]), round(bbox_center[1])],
+                    })
+                    continue
+                accepted = (char, float(confidence), bb, (bx, by, bw, bh))
                 break
             if accepted is not None:
                 break
+
+        # Save the observations + rejections to debug state so /debug can
+        # display every candidate Vision returned, with its accept/reject
+        # disposition. This is the single most useful diagnostic when the
+        # wrong character (or no character) is being recognized.
+        _debug_state['last_observations'] = log_observations
+        _debug_state['last_rejections']   = rejection_reasons
 
         if accepted is None:
             # Nothing usable in this frame
@@ -282,20 +394,12 @@ def predict():
             })
             return jsonify({'character': None, 'src_corners': _src_corners_payload(centroids, img_w, img_h)})
 
-        char, confidence, bb = accepted
+        char, confidence, bb, bbox_pixels = accepted
+        bx, by, bw, bh = bbox_pixels
         py, meaning = lookup_pinyin_and_meaning(char)
-
-        # Convert Vision's normalized bottom-left bbox to pixel coords
-        bx = int(bb.origin.x * img_w)
-        by = int((1 - bb.origin.y - bb.size.height) * img_h)
-        bw = int(bb.size.width * img_w)
-        bh = int(bb.size.height * img_h)
-        bbox_pixels = (bx, by, bw, bh)
 
         # Normalized position within the 800×800 detection zone
         # Zone is centered in the full image; top-left corner at (img_w/2-400, img_h/2-400)
-        zone_left = img_w / 2 - 400
-        zone_top  = img_h / 2 - 400
         char_cx   = bx + bw / 2
         char_cy   = by + bh / 2
         char_x_pct = max(0.0, min(1.0, (char_cx - zone_left) / 800))
@@ -308,6 +412,7 @@ def predict():
         _debug_state['confidence'] = round(float(confidence), 2)
         _debug_state['locked'] = True
         _debug_state['locked_bbox'] = bbox_pixels
+        _debug_state['last_accepted_bbox'] = bbox_pixels
 
         _log_event({
             'event': 'predict',
@@ -368,27 +473,50 @@ def debug():
 
     # Draw annotations on a copy so the stored image stays clean
     annotated = img.copy()
+    img_h, img_w = annotated.shape[:2]
     markers = state['markers']
     n = len(markers)
 
+    # ── Marker overlays (green when 4 detected, yellow with index otherwise) ──
     if state['markers_found'] and n == 4:
-        # Exactly 4 — green circles + connecting lines
         pts = order_corners(markers)
         for (cx, cy) in pts:
             cv2.circle(annotated, (cx, cy), 10, (0, 255, 0), -1)
         for i in range(4):
             cv2.line(annotated, pts[i], pts[(i + 1) % 4], (0, 255, 0), 2)
     else:
-        # Any other count — yellow circles with index labels
         for i, (cx, cy) in enumerate(markers):
             cv2.circle(annotated, (cx, cy), 10, (0, 220, 255), -1)
             cv2.putText(annotated, str(i), (cx + 13, cy + 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 255), 2, cv2.LINE_AA)
 
+    # ── Corner-erase danger zones (faint magenta rectangles) ─────────────────
+    # Anything Vision detects with its bbox center inside one of these gets
+    # rejected as ArUco residue. Visualizing them makes the rejection
+    # decisions self-evident.
+    zone_left   = img_w // 2 - 400
+    zone_top    = img_h // 2 - 400
+    zone_right  = zone_left + 800
+    zone_bottom = zone_top + 800
+    DANGER = ERASE_HALF_PX + 20
+    for (cx_c, cy_c) in [(zone_left, zone_top), (zone_right, zone_top),
+                         (zone_right, zone_bottom), (zone_left, zone_bottom)]:
+        cv2.rectangle(annotated,
+                      (cx_c - DANGER, cy_c - DANGER),
+                      (cx_c + DANGER, cy_c + DANGER),
+                      (200, 80, 200), 2)
+
+    # ── Bbox of the recognized character (yellow filled outline) ─────────────
+    bbox = state.get('locked_bbox') or state.get('last_accepted_bbox')
+    if bbox:
+        bx, by, bw, bh = bbox
+        cv2.rectangle(annotated, (bx, by), (bx + bw, by + bh), (0, 220, 255), 4)
+
+    # ── Title label, rendered with PIL so CJK glyphs come out right ──────────
     if state['character'] is not None:
         label = f"{state['character']}  conf: {state['confidence']:.2f}"
-        cv2.putText(annotated, label, (10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 220, 255), 2, cv2.LINE_AA)
+        annotated = _draw_text_with_cjk(annotated, label, (15, 10),
+                                        font_size=44, bgr_color=(0, 220, 255))
 
     # Encode annotated image as base64 PNG
     _, buf = cv2.imencode('.png', annotated)
@@ -401,6 +529,70 @@ def debug():
     char_status = 'yes' if state['character'] else 'no'
     timestamp   = state['timestamp'] or 'n/a'
 
+    # ── Build the candidate list HTML ─────────────────────────────────────────
+    # Browsers can render CJK natively, so we don't need PIL here — just
+    # emit the text and use a font-family that includes a CJK fallback.
+    # Show every candidate from the most recent OCR pass with its disposition
+    # (accepted / rejected, with reason for rejection). This is the table the
+    # user wanted: "did Vision even see X? what reasons did it reject Y?"
+    accepted_char = state['character']
+    accepted_conf = state['confidence']
+
+    def _esc(s):
+        return (str(s).replace('&', '&amp;').replace('<', '&lt;')
+                      .replace('>', '&gt;').replace('"', '&quot;'))
+
+    # Flatten observations into a list of candidates with origin info
+    candidate_rows = []
+    for obs_i, obs in enumerate(state.get('last_observations', [])):
+        for c in obs.get('candidates', []):
+            candidate_rows.append({
+                'obs': obs_i,
+                'text': c.get('text', ''),
+                'confidence': c.get('confidence', 0.0),
+            })
+
+    # Match each candidate against the rejection list to find its reason
+    rej_by_text = {}
+    for r in state.get('last_rejections', []):
+        rej_by_text.setdefault(r.get('text', ''), []).append(r)
+
+    candidate_html_rows = []
+    for c in candidate_rows:
+        # Was this candidate accepted? Match on text equality with the
+        # accepted character. Note: accepted_char is just the first hanzi,
+        # but the text could be longer; "in" handles that case.
+        is_accepted = (
+            accepted_char is not None
+            and accepted_char in c['text']
+            and not rej_by_text.get(c['text'])  # ensure not in rejection list
+        )
+        if is_accepted:
+            disp = '<span style="color:#4f4">✓ ACCEPTED</span>'
+        else:
+            # Find the reason: first matching rejection by text
+            reasons = rej_by_text.get(c['text'], [])
+            if reasons:
+                reason_text = reasons[0].get('reason', 'rejected')
+                disp = f'<span style="color:#f88">✗ {_esc(reason_text)}</span>'
+            else:
+                disp = '<span style="color:#aaa">— not chinese?</span>'
+        candidate_html_rows.append(
+            f'<tr><td class="cand">{_esc(c["text"])}</td>'
+            f'<td>{c["confidence"]:.2f}</td>'
+            f'<td>{disp}</td></tr>'
+        )
+
+    if candidate_html_rows:
+        cands_html = (
+            '<table class="cands">'
+            '<tr><th>candidate</th><th>conf</th><th>status</th></tr>'
+            + ''.join(candidate_html_rows) +
+            '</table>'
+        )
+    else:
+        cands_html = '<p class="dim">No OCR results in last frame.</p>'
+
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -412,10 +604,11 @@ def debug():
     body {{
       background: #111;
       color: #ddd;
-      font-family: 'Courier New', monospace;
+      font-family: 'Courier New', "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", monospace;
       padding: 1.5rem;
     }}
     h2 {{ color: #7ef; margin-bottom: 1rem; font-size: 1.3rem; letter-spacing: 0.05em; }}
+    h3 {{ color: #7ef; margin: 1rem 0 0.5rem; font-size: 1rem; }}
     .status {{
       display: flex;
       gap: 2rem;
@@ -426,21 +619,50 @@ def debug():
     .status b {{ color: #7ef; }}
     .yes {{ color: #4f4 !important; }}
     .no  {{ color: #f44 !important; }}
+    .dim {{ color: #888; font-size: 0.85rem; }}
+    .layout {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 380px;
+      gap: 1.5rem;
+      align-items: start;
+    }}
     img {{
       max-width: 100%;
       border: 1px solid #333;
       display: block;
     }}
+    table.cands {{
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 0.85rem;
+    }}
+    table.cands th, table.cands td {{
+      border-bottom: 1px solid #333;
+      padding: 6px 8px;
+      text-align: left;
+      vertical-align: top;
+    }}
+    table.cands th {{ color: #7ef; font-weight: normal; font-size: 0.75rem; text-transform: uppercase; }}
+    td.cand {{ font-size: 1.2rem; color: #fff; }}
   </style>
 </head>
 <body>
   <h2>MRandarin Debug View</h2>
   <div class="status">
-    <span>Markers detected: <b class="{'yes' if state['markers_found'] else 'no'}">{markers_status}</b></span>
-    <span>Character detected: <b class="{'yes' if state['character'] else 'no'}">{char_status}</b></span>
+    <span>Markers: <b class="{'yes' if state['markers_found'] else 'no'}">{markers_status}</b></span>
+    <span>Character: <b class="{'yes' if state['character'] else 'no'}">{char_status}</b></span>
     <span>Last update: <b>{timestamp}</b></span>
   </div>
-  <img src="data:image/png;base64,{img_b64}" alt="processed frame">
+  <div class="layout">
+    <img src="data:image/png;base64,{img_b64}" alt="processed frame">
+    <div>
+      <h3>Last OCR candidates</h3>
+      {cands_html}
+      <p class="dim" style="margin-top:0.75rem">
+        Magenta squares on the image = corner-erase danger zones. Yellow box = accepted bbox.
+      </p>
+    </div>
+  </div>
 </body>
 </html>"""
     return html, 200, {'Content-Type': 'text/html; charset=utf-8'}
@@ -474,13 +696,16 @@ def reset():
     """
     global _state
     _state = 'SEARCHING_RED'
-    _debug_state['locked']        = False
-    _debug_state['locked_bbox']   = None
-    _debug_state['character']     = None
-    _debug_state['confidence']    = None
-    _debug_state['markers_found'] = False
-    _debug_state['markers']       = []
-    _debug_state['timestamp']     = datetime.now().isoformat(timespec='seconds')
+    _debug_state['locked']             = False
+    _debug_state['locked_bbox']        = None
+    _debug_state['last_accepted_bbox'] = None
+    _debug_state['last_observations']  = []
+    _debug_state['last_rejections']    = []
+    _debug_state['character']          = None
+    _debug_state['confidence']         = None
+    _debug_state['markers_found']      = False
+    _debug_state['markers']            = []
+    _debug_state['timestamp']          = datetime.now().isoformat(timespec='seconds')
     print('[state] RESET → SEARCHING_RED')
     _log_event({'event': 'reset', 'state': _state})
     # Rotate the log file so the next session goes into a new .jsonl.

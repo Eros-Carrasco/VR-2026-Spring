@@ -72,14 +72,28 @@ def lookup_pinyin_and_meaning(char):
 
     Skips surname-only definitions when other meanings exist; trims classifier
     info (/CL:...) and caps the meaning to its first 3 slash-separated glosses.
+
+    Wrapped in try/except because hanzipy and pypinyin can raise on rare /
+    obscure characters (we observed a bare StopIteration during testing —
+    PEP-479-prone code somewhere in their internals). Returning a soft default
+    (`'?'`, `'unknown'`) lets the caller decide whether to accept or reject
+    the candidate without taking down the whole /predict request.
     """
-    py = pinyin(char, style=Style.TONE)[0][0]
-    definition = _dictionary.definition_lookup(char)
-    # skip surname entries to get the actual meaning
-    meaning = next(
-        (d['definition'] for d in definition if not d['definition'].startswith('surname')),
-        definition[0]['definition'] if definition else 'unknown'
-    )
-    meaning = meaning.split('/CL:')[0]
-    meaning = '/'.join(meaning.split('/')[:3])
+    try:
+        py = pinyin(char, style=Style.TONE)[0][0]
+    except Exception as e:
+        print(f'[lookup] pinyin lookup failed for {char!r}: {e}')
+        py = '?'
+    try:
+        definition = _dictionary.definition_lookup(char)
+        # skip surname entries to get the actual meaning
+        meaning = next(
+            (d['definition'] for d in definition if not d['definition'].startswith('surname')),
+            definition[0]['definition'] if definition else 'unknown'
+        )
+        meaning = meaning.split('/CL:')[0]
+        meaning = '/'.join(meaning.split('/')[:3])
+    except Exception as e:
+        print(f'[lookup] dictionary lookup failed for {char!r}: {e}')
+        meaning = 'unknown'
     return py, meaning

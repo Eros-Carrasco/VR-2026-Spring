@@ -76,13 +76,42 @@ def normalize_image(bgr_image, centroids):
     canvas = np.full_like(bgr_image, 255)
     canvas[region_mask == 255] = warped_full[region_mask == 255]
 
-    # Erase marker dots at their transformed positions in the output space
+    # ── Erase markers at their transformed positions in the output space ─────
+    # Why a 160×160 px square (80 px half-side) and not a 40-px-radius circle:
+    #   • Red dots (~10–20 px) are tiny — anything bigger than them works.
+    #   • ArUco markers are different. For a 30-cm zone with 3-cm ArUcos,
+    #     the markers occupy roughly 80 × 80 px of the 800 × 800 warped
+    #     region. A 40-px-radius circle is just barely inscribed in the
+    #     square ArUco — meaning the four CORNERS of the ArUco (at radius
+    #     56 px from center) poke out beyond the erase circle. Those
+    #     remnants, after the contrast boost (cv2.convertScaleAbs alpha=1.5)
+    #     downstream, look like crisp black L-shapes that Apple Vision
+    #     happily recognizes as Chinese characters ("L", "勺", "q", …).
+    #     That contaminated the OCR — Vision was reading the marker
+    #     residues instead of the actual hanzi the user wrote in the
+    #     center of the zone.
+    #   • A 160-px square covers the marker AND a generous halo around it,
+    #     so even slightly mis-positioned markers or ArUcos at non-square
+    #     orientations are fully wiped. We lose 80/400 = 20% of each axis
+    #     near the corners, but the remaining central 480 × 480 px
+    #     (≈18 × 18 cm in a 30-cm zone) is plenty for hand-written hanzi.
     src_pts = np.array([ordered], dtype=np.float32)
     dst_pts = cv2.perspectiveTransform(src_pts, H)[0]
+    ERASE_HALF = 80
     for (x, y) in dst_pts:
-        cv2.circle(canvas, (int(x), int(y)), 40, (255, 255, 255), -1)
+        x, y = int(x), int(y)
+        cv2.rectangle(canvas, (x - ERASE_HALF, y - ERASE_HALF),
+                              (x + ERASE_HALF, y + ERASE_HALF),
+                      (255, 255, 255), -1)
 
     return canvas
+
+
+# Pixel half-side of the corner-erase region used in normalize_image. Exposed
+# for use in mrandarin_main.py's bbox sanity check — anything Vision reports
+# inside that erased zone is by definition garbage (ArUco remnants etc), so
+# we reject it before accepting it as a recognized character.
+ERASE_HALF_PX = 80
 
 
 def is_valid_quad(centroids):
