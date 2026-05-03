@@ -12,8 +12,25 @@ def is_chinese(text):
     return any('\u4e00' <= char <= '\u9fff' for char in text)
 
 
+# Number of OCR candidates to request from Vision per detected text region.
+# Vision returns these ranked by its own confidence; the first one is its
+# best guess, but for handwritten hanzi the first guess is sometimes wrong
+# while the 2nd or 3rd is right. Pulling 3 lets the caller pick the best
+# Chinese-shaped candidate instead of being stuck with whatever Vision
+# returned first (which sometimes is a digit, English letter, or whitespace).
+_OCR_TOP_K = 3
+
+
 def run_vision_ocr(image_bytes):
-    """Run Apple Vision text recognition on raw PNG bytes."""
+    """Run Apple Vision text recognition on raw PNG bytes.
+
+    Returns a list of observation dicts:
+        [{'candidates': [(text, confidence), ...], 'bb': CGRect}, ...]
+
+    Each observation has up to _OCR_TOP_K candidates, ranked by Vision's
+    confidence (highest first). The bb is shared across candidates within
+    the same observation.
+    """
     data = Quartz.CFDataCreate(None, image_bytes, len(image_bytes))
     data_provider = Quartz.CGDataProviderCreateWithCFData(data)
     cg_image = Quartz.CGImageCreateWithPNGDataProvider(
@@ -28,15 +45,18 @@ def run_vision_ocr(image_bytes):
         observations = request.results()
         if observations:
             for obs in observations:
-                text = obs.topCandidates_(1)[0].string()
-                confidence = obs.topCandidates_(1)[0].confidence()
+                top_candidates = obs.topCandidates_(_OCR_TOP_K)
+                # Build a list of (text, confidence) tuples for all candidates
+                candidates = []
+                for cand in top_candidates:
+                    candidates.append((cand.string(), cand.confidence()))
                 bb = obs.boundingBox()  # CGRect normalized, origin bottom-left
-                results.append((text, confidence, bb))
+                results.append({'candidates': candidates, 'bb': bb})
 
     req = Vision.VNRecognizeTextRequest.alloc().initWithCompletionHandler_(handler)
     req.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
     req.setRecognitionLanguages_(['zh-Hans'])
-    # req.setRecognitionLanguages_(['zh-Hans', 'zh-Hant']) Hans is simplified, Hant is traditional. For now I'll focus on simplified.
+    # zh-Hans = simplified, zh-Hant = traditional. Focusing on simplified only.
     req.setUsesLanguageCorrection_(False)
 
     handler_obj = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(

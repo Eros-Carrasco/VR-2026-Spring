@@ -111,14 +111,24 @@ export const init = async model => {
    const ARUCO_Z_LIFT    = -0.015;  // 1.5 cm toward the viewer (negative because
                                     // PnP +Z points toward the wall in this scene)
 
-   // Always-on side plaques (above & below the zone). Sized in absolute meters
-   // rather than as fractions of the zone — the zone (your dot square) might
-   // be quite small, but the plaques should stay readable. Adjust freely.
+   // Always-on side plaques (above & to the left of the zone). Sized in
+   // absolute meters rather than as fractions of the zone — the zone (your
+   // dot square) might be quite small, but the plaques should stay readable.
+   //
+   // Title sits ABOVE the zone (horizontal banner).
+   // Course info sits to the LEFT of the zone (vertical strip — taller than
+   // wide, because the four lines stack vertically).
    const TITLE_HALF_W    = 0.18;   // 36 cm wide
    const TITLE_HALF_H    = 0.045;  //  9 cm tall
-   const COURSE_HALF_W   = 0.18;
-   const COURSE_HALF_H   = 0.07;   // 14 cm tall (4 lines of text)
-   const PLAQUE_GAP      = 0.025;  // 2.5 cm gap between plaque and zone edge
+   const COURSE_HALF_W   = 0.085;  // 17 cm wide  — narrow vertical strip
+   const COURSE_HALF_H   = 0.13;   // 26 cm tall  — fits 4 stacked lines
+   const PLAQUE_GAP      = 0.05;   // 5 cm gap between plaque and zone edge.
+                                   // Previously 2.5 cm, but the corner ArUcos
+                                   // (3 cm side) sit right at the zone corners
+                                   // and visibly grazed the plaque edges.
+                                   // Doubling the gap leaves a clear ~3.5 cm
+                                   // air-gap between any ArUco and the
+                                   // closest plaque edge.
 
    // ── Joystick zone-resize constants ────────────────────────────────────────
    //
@@ -145,22 +155,163 @@ export const init = async model => {
    // creating false positives. A cyan reticle is invisible to the HSV pipeline
    // and visually distinct enough from the physical dot that the user can tell
    // them apart at a glance.
-   const DOT_INDICATOR_HALF = 0.04;   // 4 cm half-side → 8 cm reticle
+   // Crosshair angular half-size, in radians. At distance d from the headset,
+   // the crosshair renders at world-space half-size = DOT_INDICATOR_ANGULAR_HALF
+   // × d, which keeps its apparent size on screen CONSTANT regardless of how
+   // far the zone is.
+   //
+   // Why angular rather than fixed meters: with a fixed 8 cm crosshair, the
+   // ring looked huge when ZONE_SIDE was small (zone close → reticle close
+   // → big on screen) and tiny when ZONE_SIDE was large. That made it
+   // ambiguous whether the user was seeing the wrong size because the
+   // calibration was off, or just because the zone was at a different
+   // distance. Angular sizing makes the reticle visually invariant to
+   // calibration distance — only its position changes when the user tunes
+   // ZONE_SIDE, which is exactly the signal needed.
+   //
+   // 0.04 rad ≈ 2.3° half-angle (≈ 4.6° full-angle). At 1 m this gives
+   // 8 cm reticle in world space — same as the old fixed value at typical
+   // working distance, so the visual is preserved at common distances.
+   const DOT_INDICATOR_ANGULAR_HALF = 0.04;
 
    // ── Hanzi VFX constants (TUNE THESE) ──────────────────────────────────────
-   const HANZI_LINE_LEN  = 0.04;  // meters — length of cardinal lines from bbox edge to panel
-   const HANZI_PANEL_MUL = 1.5;   // panel side = HANZI_PANEL_MUL × max(bbox_w, bbox_h)
+   // Both the line length and the panel size scale with the bbox of the
+   // recognized character — bigger character → bigger lines and panels,
+   // small character → smaller everything. This keeps the cardinal layout
+   // visually balanced regardless of how big the user wrote the hanzi.
+   //
+   // HANZI_LINE_FACTOR — fraction of bboxSide for each cardinal line's
+   //                     length. With factor 0.4 and a 7-cm hanzi, lines
+   //                     are 2.8 cm long, which leaves room for the panel
+   //                     just past the line.
+   // HANZI_PANEL_MUL  — panel side as a multiple of the bbox side. 1.0
+   //                     means the panel is the same size as the hanzi —
+   //                     compact and proportional. (Was 1.5; that made
+   //                     panels so big they didn't fit between the bbox
+   //                     and the zone edge.)
+   const HANZI_LINE_FACTOR = 0.4;
+   const HANZI_PANEL_MUL   = 1.0;
+
+   // ── UI palette ────────────────────────────────────────────────────────────
+   // All UI chrome (zone outlines, panel borders, crosshair rings, connector
+   // lines, plaque borders, title text) shares one accent color. Defined
+   // ONCE here so the whole UI re-tints from a single edit. The chosen
+   // accent #b9d9fa is a soft cool white-blue — distinct from the
+   // whiteboard's pure white and the black/white of the ArUco markers, so
+   // the AR overlays don't blend into the physical surface or the markers.
+   //
+   // Convention: each color array is [r, g, b] in 0-1. Alpha is applied
+   // per-call via the helpers below (rgba) so a single accent can drive
+   // bright lines, soft fills, and dim ghosts without duplicating the rgb.
+   const UI_ACCENT       = [0.725, 0.851, 0.980]; // #b9d9fa  cool white-blue
+   const UI_ACCENT_DIM   = [0.580, 0.680, 0.784]; // 80% mix toward dark for muted variant
+   const UI_TEXT_PRIMARY = [1.0, 1.0, 1.0];        // pure white for max readability
+   const UI_PANEL_BG     = [0.04, 0.06, 0.10];     // very dark blue-black, panel fill
+   // Preview-mode plane fill: a gray mid-tone with low alpha so the user can
+   // see the plane's depth in 3D without it occluding the physical dots or
+   // the wall behind it. Per user's reference image, this is the actual
+   // surface visualization (not just an outline).
+   const UI_PLANE_FILL   = [0.45, 0.50, 0.55];     // neutral gray
+   // Helper: pack [r,g,b] + alpha into the 4-element array g2.setColor wants.
+   const rgba = (c, a) => [c[0], c[1], c[2], a];
+
+   // Corner-radius for rounded panel/plaque outlines (in g2 canvas units,
+   // [-1..1]). 0.16 ≈ 8% of the side, matching the reference image's
+   // soft-rounded look without going full pill.
+   const UI_CORNER_R     = 0.16;
+
+   // Outline thickness for panel/plaque borders. Per the user's reference
+   // images (Airbnb, IKEA, Apple Health), the outline is a SUBTLE accent,
+   // not structural — thin enough to feel like a refined edge, not a frame.
+   // 0.015 in canvas units is roughly 1-2 px on a 1024-px canvas.
+   const UI_OUTLINE_W    = 0.015;
+
+   // Auto-fit text helper: returns the largest textHeight at which `text`
+   // fits within maxWidth (in g2 canvas units, where the panel spans 2.0
+   // wide and 2.0 tall). Probes from `maxH` downward in 0.02 steps until
+   // the text fits with a 90% safety margin.
+   //
+   // Why this exists: textHeight(h) scales font-size linearly, but the
+   // rendered text width depends on glyph aspect, font, and string length.
+   // A static textHeight that looks fine for "PINYIN" (6 chars) overflows
+   // "MR-andarin" (10 chars) on the same panel size. Measuring at runtime
+   // is the only way to keep all labels readable across panel sizes.
+   //
+   // Returns the textHeight already SET on the g2 instance (so the caller
+   // can immediately call .text()), and additionally returns the value
+   // for inspection.
+   function fitText(g2, text, maxWidthG2, maxH = 0.6, minH = 0.08) {
+      // Text width is queried via the g2's Canvas measureText. We probe
+      // by setting textHeight (which sets font), measuring, comparing.
+      const ctx = g2.getContext();
+      const safe = maxWidthG2 * 0.90;
+      for (let h = maxH; h >= minH; h -= 0.02) {
+         g2.textHeight(h);
+         const widthCanvasPx = ctx.measureText(text).width;
+         // g2's coord system: width 2.0 corresponds to canvas.width pixels.
+         // So text-width-in-g2-units = widthCanvasPx / canvas.width * 2.
+         const widthG2 = widthCanvasPx / g2.getCanvas().width * 2;
+         if (widthG2 <= safe) return h;
+      }
+      // Couldn't fit even at minH — return minH so SOMETHING draws.
+      g2.textHeight(minH);
+      return minH;
+   }
+
+   // Draw an outline with broken corners (4 separate segments, with a
+   // visible gap at each corner). Per the WebXR-style reference image,
+   // this is the "modern XR UI" look — outline as accent rather than
+   // a continuous frame. Each segment terminates `gap` short of where
+   // the corner would be, leaving a visible cutout at every corner.
+   //
+   // Coordinates: rectangle from (x, y) to (x+w, y+h). gap is in g2 units;
+   // a value around 0.18 looks good against UI_CORNER_R = 0.16 (just a
+   // bit larger so the gap visibly extends past where the rounded corner
+   // would have been).
+   function drawBrokenOutline(g2, x, y, w, h, gap) {
+      const x0 = x, x1 = x + w;
+      const y0 = y, y1 = y + h;
+      // top edge — gap at both ends
+      g2.drawPath([[x0 + gap, y1], [x1 - gap, y1]]);
+      // bottom edge
+      g2.drawPath([[x0 + gap, y0], [x1 - gap, y0]]);
+      // left edge — gap at top and bottom
+      g2.drawPath([[x0, y0 + gap], [x0, y1 - gap]]);
+      // right edge
+      g2.drawPath([[x1, y0 + gap], [x1, y1 - gap]]);
+   }
 
    // ── VFX choreography (seconds, relative to event start) ───────────────────
    // Hanzi event (fires when a new character is detected):
+   //
    //   0.0 - 0.6   sparks fly outward from bbox center
-   //   0.6 - 1.2   cardinal lines extend from bbox edges
-   //   1.2 - 1.8   info panels grow + fade in
-   const T_SPARK_DUR   = 0.6;
-   const T_LINE_START  = T_SPARK_DUR;                   // 0.6
-   const T_LINE_DUR    = 0.6;
-   const T_PANEL_START = T_LINE_START + T_LINE_DUR;     // 1.2
-   const T_PANEL_DUR   = 0.6;
+   //   0.6 - 1.6   cardinal lines extend from bbox edges (1.0 s, slower than
+   //               before so the connection between character and panels
+   //               feels deliberate, not like a quick crosshair pop)
+   //   1.6 - 2.0   panel TOP    (meaning) grows in
+   //   2.0 - 2.4   panel RIGHT  (pinyin) grows in
+   //   2.4 - 2.8   panel LEFT   (image) grows in
+   //   2.8 - 3.2   panel BOTTOM (sentence) grows in
+   //
+   // The four panels enter sequentially rather than simultaneously so the
+   // user's eye can track each one as it appears. Each panel takes 0.4 s to
+   // grow (T_PANEL_DUR), and each starts 0.4 s after the previous one
+   // (T_PANEL_STAGGER = T_PANEL_DUR, so they don't overlap).
+   const T_SPARK_DUR     = 0.6;
+   const T_LINE_START    = T_SPARK_DUR;                         // 0.6
+   const T_LINE_DUR      = 1.0;                                 // slower lines
+   const T_PANELS_START  = T_LINE_START + T_LINE_DUR;           // 1.6
+   const T_PANEL_DUR     = 0.4;                                 // per-panel grow time
+   const T_PANEL_STAGGER = 0.4;                                 // delay between consecutive panels
+   // Panel-specific start times (sequential):
+   //   meaning  (TOP)    starts at 0 of the panels phase
+   //   pinyin   (RIGHT)  starts at 1× stagger
+   //   image    (LEFT)   starts at 2× stagger
+   //   sentence (BOTTOM) starts at 3× stagger
+   const T_PANEL_TOP_START    = T_PANELS_START + 0 * T_PANEL_STAGGER;
+   const T_PANEL_RIGHT_START  = T_PANELS_START + 1 * T_PANEL_STAGGER;
+   const T_PANEL_LEFT_START   = T_PANELS_START + 2 * T_PANEL_STAGGER;
+   const T_PANEL_BOTTOM_START = T_PANELS_START + 3 * T_PANEL_STAGGER;
    // Surface event (fires when lockCounter advances):
    //   0.0 - 1.5   LIDAR-style scan across the zone, then fades
    //   perimeter persists indefinitely after that
@@ -187,8 +338,30 @@ export const init = async model => {
    // ── G2 canvases for the always-on info plaques (above & below the zone) ──
    //    Static — drawn once at init, then just blitted onto their panels each
    //    frame at whatever world pose the zone matrix dictates.
-   let g2Title      = new G2();   // "MR-andarin" header above the zone
-   let g2CourseInfo = new G2();   // course / instructor / date plaque below
+   //
+   //    g2Title is created with an EXPLICIT 4:1 canvas (1024×256) to match
+   //    the title plaque's aspect ratio (TITLE_HALF_W=0.18, TITLE_HALF_H=0.045).
+   //    With G2's default 512×512 square canvas, anything drawn was stretched
+   //    4× horizontally when projected onto the wide plaque, which made the
+   //    title letters look squashed (vertically) and elongated (horizontally).
+   //    Matching the canvas aspect to the panel aspect eliminates the
+   //    distortion at its source — text drawn with normal proportions on a
+   //    4:1 canvas maps onto a 4:1 panel with no stretch.
+   let g2Title      = new G2(false, 1024, 256);   // "MR-andarin" header above the zone
+   let g2CourseInfo = new G2();                    // course / instructor / date plaque below
+
+   // ── Axolotl intro image (replaces "MR-andarin" text in the lock animation) ──
+   // Loaded once at init; rendered into g2Surface each frame during the intro
+   // window after lock. Image fades in/out alongside the existing LIDAR scan.
+   // We check both `complete` and `naturalWidth` before drawing — `complete`
+   // alone is true even on load failure, but a failed load gives naturalWidth=0.
+   let axolotlImage = null;
+   {
+      const _img = new Image();
+      _img.onload  = () => { axolotlImage = _img; };
+      _img.onerror = (e) => console.warn('[MRandarin] axolotl image failed to load:', e);
+      _img.src = '../media/images/axolotl.png';
+   }
 
    // ── Texture slot assignments ──────────────────────────────────────────────
    // 0-3 = ArUco PNGs (TL, TR, BR, BL)
@@ -313,24 +486,34 @@ export const init = async model => {
    // The `alpha` driver is the panel-progress eased value, so the panels fade
    // in alongside their grow animation (T_PANEL_START..T_PANEL_DUR).
 
-   function panelAlpha() {
+   // The `alpha` driver is the per-panel progress eased value, so each panel
+   // fades in alongside its own grow animation. With sequential reveals, each
+   // panel has its own start time (T_PANEL_TOP_START, T_PANEL_RIGHT_START,
+   // etc.) so they enter one at a time rather than all together.
+
+   function panelAlphaFor(startTime) {
       if (!hanziActive) return 0;
       const t = model.time - hanziStartTime;
-      const pp = Math.max(0, Math.min(1, (t - T_PANEL_START) / T_PANEL_DUR));
+      const pp = Math.max(0, Math.min(1, (t - startTime) / T_PANEL_DUR));
       return pp;
    }
+   // Convenience wrappers for each cardinal panel:
+   const panelAlphaMeaning  = () => panelAlphaFor(T_PANEL_TOP_START);
+   const panelAlphaPinyin   = () => panelAlphaFor(T_PANEL_RIGHT_START);
+   const panelAlphaImage    = () => panelAlphaFor(T_PANEL_LEFT_START);
+   const panelAlphaSentence = () => panelAlphaFor(T_PANEL_BOTTOM_START);
 
    function drawPanelChrome(g2, alpha) {
       const ctx = g2.getContext(), canvas = g2.getCanvas();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       if (alpha <= 0) return false;
-      // Background
-      g2.setColor([0.02, 0.05, 0.1, 0.85 * alpha]);
-      g2.fillRect(-1, -1, 2, 2);
-      // Border
-      g2.setColor([0.0, 1.0, 0.9, 0.5 * alpha]);
-      g2.lineWidth(0.04);
-      g2.drawPath([[-1, -1], [1, -1], [1, 1], [-1, 1], [-1, -1]]);
+      // Borderless panel: just a soft translucent fill so the wall reads
+      // through. Per spec we removed the broken-corner outline entirely —
+      // outline was busy and competed with the title/value text for visual
+      // weight. Bg alpha lowered from 0.85 → 0.45 so the panel looks like
+      // a tinted overlay rather than an opaque card.
+      g2.setColor(rgba(UI_PANEL_BG, 0.45 * alpha));
+      g2.fillRect(-0.98, -0.98, 1.96, 1.96, UI_CORNER_R);
       return true;
    }
 
@@ -341,36 +524,37 @@ export const init = async model => {
    };
 
    g2Pinyin.render = function () {
-      const alpha = panelAlpha();
+      const alpha = panelAlphaPinyin();
       if (!drawPanelChrome(this, alpha)) return;
       if (!displayPinyin) return;
-      // Small title
-      this.setColor([0.0, 1.0, 0.9, alpha]);
-      this.textHeight(0.13);
-      this.text('PINYIN', 0, 0.65, 'center');
-      // Pinyin reading
-      this.setColor([1, 1, 1, alpha]);
-      this.textHeight(0.32);
-      this.text(displayPinyin, 0, -0.05, 'center');
+      // Title row at top — small accent color label
+      this.setColor(rgba(UI_ACCENT, alpha));
+      fitText(this, 'PINYIN', 1.6, 0.18);   // narrow max height = small label
+      this.text('PINYIN', 0, 0.62, 'center');
+      // Pinyin reading — hero text, auto-fit. textHeight max 0.50 keeps
+      // even long pinyin strings ("zhuàng" etc) from overflowing.
+      this.setColor(rgba(UI_TEXT_PRIMARY, alpha));
+      fitText(this, displayPinyin, 1.6, 0.50);
+      this.text(displayPinyin, 0, -0.10, 'center');
    };
 
    g2Meaning.render = function () {
-      const alpha = panelAlpha();
+      const alpha = panelAlphaMeaning();
       if (!drawPanelChrome(this, alpha)) return;
       if (!displayMeaning) return;
-      // Small title
-      this.setColor([0.0, 1.0, 0.9, alpha]);
-      this.textHeight(0.13);
-      this.text('MEANING', 0, 0.65, 'center');
+      // Title row
+      this.setColor(rgba(UI_ACCENT, alpha));
+      fitText(this, 'MEANING', 1.6, 0.18);
+      this.text('MEANING', 0, 0.62, 'center');
       // Meaning — capped to first '/' segment per spec ("máximo 1 meaning")
       const firstMeaning = displayMeaning.split('/')[0].trim();
-      this.setColor([1, 1, 1, alpha]);
-      this.textHeight(0.22);
-      this.text(firstMeaning, 0, -0.05, 'center');
+      this.setColor(rgba(UI_TEXT_PRIMARY, alpha));
+      fitText(this, firstMeaning, 1.6, 0.40);
+      this.text(firstMeaning, 0, -0.10, 'center');
    };
 
    g2Image.render = function () {
-      const alpha = panelAlpha();
+      const alpha = panelAlphaImage();
       if (!drawPanelChrome(this, alpha)) return;
       if (displayImage) {
          const ctx = this.getContext();
@@ -399,23 +583,27 @@ export const init = async model => {
    };
 
    g2AI.render = function () {
-      const alpha = panelAlpha();
+      const alpha = panelAlphaSentence();
       if (!drawPanelChrome(this, alpha)) return;
       if (displayAI) {
-         this.setColor([0.85, 0.85, 0.85, alpha]);
-         this.textHeight(0.13);
+         this.setColor(rgba(UI_TEXT_PRIMARY, alpha));
+         // Wrap words into lines no wider than 18 chars (loose limit; the
+         // real fit happens via fitText below).
          const words = displayAI.split(' ');
          const lines = [];
          let line = '';
          for (const w of words) {
-            if ((line + w).length > 20) { lines.push(line.trim()); line = ''; }
+            if ((line + w).length > 18) { lines.push(line.trim()); line = ''; }
             line += w + ' ';
          }
          if (line.trim()) lines.push(line.trim());
+         // Auto-fit using the LONGEST line so all lines render at the same size.
+         const longest = lines.reduce((a, b) => a.length > b.length ? a : b, '');
+         fitText(this, longest, 1.6, 0.30);
          this.text(lines.join('\n'), 0, 0, 'center');
       } else {
-         this.setColor([0.3, 0.3, 0.3, alpha]);
-         this.textHeight(0.12);
+         this.setColor(rgba(UI_ACCENT, alpha * 0.5));
+         fitText(this, 'asking AI...', 1.6, 0.18);
          this.text('asking AI...', 0, 0, 'center');
       }
    };
@@ -456,29 +644,24 @@ export const init = async model => {
       const ctx = this.getContext(), canvas = this.getCanvas();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // Outer ring
-      this.setColor([0.4, 0.95, 1.0, 0.95]);
-      this.lineWidth(0.08);
-      const segs = 32, r = 0.85;
+      // Just an open ring. No crosshair lines, no filled center — those would
+      // sit on top of the physical red dot the user is trying to align with,
+      // and obscure the very target they need to see. The hollow center
+      // means the dot is fully visible THROUGH the ring once aligned.
+      //
+      // Alpha lowered to 0.55 so that even when the ring momentarily passes
+      // over a physical red dot during head movement, the dot is still
+      // recognizable through it — the backend's HSV detector can still find
+      // the dot beneath a translucent overlay.
+      this.setColor(rgba(UI_ACCENT, 0.55));
+      this.lineWidth(0.10);
+      const segs = 32, r = 0.78;
       const ring = [];
       for (let i = 0; i <= segs; i++) {
          const a = (i / segs) * Math.PI * 2;
          ring.push([Math.cos(a) * r, Math.sin(a) * r]);
       }
       this.drawPath(ring);
-
-      // 4 crosshair tick marks (with a gap in the middle for the dot)
-      this.lineWidth(0.06);
-      this.drawPath([[-0.55, 0],   [-0.20, 0]]);
-      this.drawPath([[ 0.20, 0],   [ 0.55, 0]]);
-      this.drawPath([[0, -0.55],   [0, -0.20]]);
-      this.drawPath([[0,  0.20],   [0,  0.55]]);
-
-      // Bright center dot (filled) — kept small on purpose. A bigger dot
-      // would cover the physical red dot it's supposed to align with,
-      // making fine calibration harder.
-      this.setColor([0.7, 1.0, 1.0, 1.0]);
-      this.fillOval(-0.08, -0.08, 0.16, 0.16);
    };
    // Render the canvas once at init — its content never changes (no animation).
    g2DotIndicator.update();
@@ -493,20 +676,26 @@ export const init = async model => {
       const ctx = this.getContext(), canvas = this.getCanvas();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // Dark translucent background so the text reads against bright passthrough
-      this.setColor([0.02, 0.05, 0.10, 0.78]);
-      this.fillRect(-1, -1, 2, 2);
+      // Borderless: translucent fill only. Same alpha (0.45) as the hanzi
+      // info panels so the whole UI reads as one consistent material —
+      // tinted glass against the wall.
+      //
+      // Corner radius `r` here is in g2 X-units, and g2 converts via
+      // w2c(r) = canvas.width/2 * r → on a 1024-px-wide canvas, r=0.04
+      // gives a 20-px corner radius. That's ~16% of the canvas height
+      // (256), matching the visual rounding ratio we'd get on a square
+      // canvas with UI_CORNER_R=0.16. (UI_CORNER_R itself would give an
+      // 82-px radius here, which would look almost pill-shaped on a 4:1
+      // rectangle. Using 0.04 instead keeps the style consistent.)
+      this.setColor(rgba(UI_PANEL_BG, 0.45));
+      this.fillRect(-0.98, -0.98, 1.96, 1.96, 0.04);
 
-      // Cyan border (matches the surface VFX accent color)
-      this.setColor([0.0, 1.0, 0.9, 0.7]);
-      this.lineWidth(0.04);
-      this.drawPath([[-0.97, -0.93], [0.97, -0.93], [0.97, 0.93], [-0.97, 0.93], [-0.97, -0.93]]);
-
-      // Title text. textHeight is in canvas-units where 2.0 = full canvas
-      // height — using values around 0.25–0.4 matches the other info panels
-      // and keeps the text readable rather than gigantic.
-      this.setColor([0.85, 1.0, 1.0, 1.0]);
-      this.textHeight(0.40);
+      // Title text — now with natural proportions because the canvas
+      // (1024×256) matches the plaque's 4:1 aspect ratio. fitText finds
+      // the largest textHeight where "MR-andarin" still fits with
+      // comfortable horizontal margin (10% safety baked in).
+      this.setColor(rgba(UI_TEXT_PRIMARY, 1.0));
+      fitText(this, 'MR-andarin', 1.7, 0.7);
       this.text('MR-andarin', 0, 0, 'center');
    };
    g2Title.update();
@@ -514,32 +703,75 @@ export const init = async model => {
    // ─────────────────────────────────────────────────────────────────────────
    // COURSE-INFO PLAQUE
    // ─────────────────────────────────────────────────────────────────────────
-   // Static. Sits below the zone. Same chrome as the title plaque.
+   // Static. Sits to the LEFT of the zone as a vertical strip. The strip is
+   // narrow horizontally and tall vertically, so we lay each label/value pair
+   // as two stacked rows: tiny label, small value, blank gap, repeat.
    g2CourseInfo.render = function () {
       const ctx = this.getContext(), canvas = this.getCanvas();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // Background
-      this.setColor([0.02, 0.05, 0.10, 0.78]);
-      this.fillRect(-1, -1, 2, 2);
+      // Borderless translucent fill — matches title plaque + hanzi panels.
+      this.setColor(rgba(UI_PANEL_BG, 0.45));
+      this.fillRect(-0.98, -0.98, 1.96, 1.96, UI_CORNER_R);
 
-      // Border
-      this.setColor([0.0, 1.0, 0.9, 0.7]);
-      this.lineWidth(0.04);
-      this.drawPath([[-0.97, -0.95], [0.97, -0.95], [0.97, 0.95], [-0.97, 0.95], [-0.97, -0.95]]);
-
-      // Body text (4 lines)
-      const lines = [
-         'Student:    Eros Carrasco',
-         'Course:     CSCI-GA 3033 — Virtual Reality',
-         'Instructor: Kenneth Perlin',
-         'Date:       May 5, 2026',
+      // Three label/value pairs, stacked vertically. DATE row removed per
+      // spec — it was the least useful piece of info on the plaque and
+      // its presence forced 4 rows into the same vertical space, making
+      // each value crowd the label of the row below.
+      //
+      // Layout for 3 rows (canvas height 2.0, usable ~1.6 from -0.8..+0.8):
+      //   - rowH = 0.55 (vs old 0.42 for 4 rows)
+      //   - labelToValueGap = 0.22 (label sits ABOVE its value within the row)
+      //   - This leaves rowH - labelToValueGap = 0.33 between a value's
+      //     bottom and the next label's top, plenty of breathing room.
+      const entries = [
+         ['STUDENT',    'Eros Carrasco'],
+         ['COURSE',     'CSCI-GA 3033'],
+         ['INSTRUCTOR', 'Kenneth Perlin'],
       ];
-      this.setColor([0.85, 0.92, 1.0, 1.0]);
-      this.textHeight(0.18);
-      const topY = 0.55, lineSpacing = 0.32;
-      for (let i = 0; i < lines.length; i++) {
-         this.text(lines[i], -0.85, topY - i * lineSpacing, 'left');
+
+      // Find a single value-textHeight that fits the longest VALUE so all
+      // value rows render at the same size. Then a smaller label-textHeight
+      // for all labels.
+      const longestValue = entries.reduce(
+         (max, [_, v]) => v.length > max.length ? v : max, ''
+      );
+      // Probe value size first — capped LOWER than before (0.18 → 0.13)
+      // because at the old size the value occupied so much vertical room
+      // that consecutive rows visually touched. 0.13 leaves clear gaps.
+      const VALUE_MAX_H = 0.13;
+      const valueH = (() => {
+         const ctx2 = this.getContext();
+         const safe = 1.7 * 0.90;
+         for (let h = VALUE_MAX_H; h >= 0.07; h -= 0.01) {
+            this.textHeight(h);
+            const w = ctx2.measureText(longestValue).width / canvas.width * 2;
+            if (w <= safe) return h;
+         }
+         return 0.07;
+      })();
+      // Labels sit slightly smaller than values — small uppercase caption
+      // style. 0.65× factor preserved from the old 4-row layout.
+      const labelH = Math.max(0.07, valueH * 0.65);
+
+      // Render rows with comfortable spacing. Centered vertically:
+      //   first row starts at +0.65, last row ends near -0.65 → ~1.3 of
+      //   1.6 usable height, leaving ~0.15 padding top and bottom.
+      const topY    = 0.65;
+      const rowH    = 0.55;
+      const labelToValueGap = 0.22;
+      for (let i = 0; i < entries.length; i++) {
+         const [label, value] = entries[i];
+         const yLabel = topY - i * rowH;
+         const yValue = yLabel - labelToValueGap;
+
+         this.setColor(rgba(UI_ACCENT, 0.95));
+         this.textHeight(labelH);
+         this.text(label, 0, yLabel, 'center');
+
+         this.setColor(rgba(UI_TEXT_PRIMARY, 1.0));
+         this.textHeight(valueH);
+         this.text(value, 0, yValue, 'center');
       }
    };
    g2CourseInfo.update();
@@ -563,34 +795,44 @@ export const init = async model => {
    // Intro-animation timeline (relative to surfaceStartTime):
    //   0.0 – 0.4 s   border fades in to full alpha
    //                 LIDAR ring expands from center
-   //                 "MR-andarin" text fades in
-   //   0.4 – 1.0 s   text holds at peak
+   //                 axolotl image fades in
+   //   0.4 – 3.4 s   image holds at peak (3 seconds — long enough for the
+   //                 user to read the badge and feel like the zone is
+   //                 deliberately framed by the mascot)
    //   1.0 – 1.4 s   ring continues until it leaves the canvas
-   //   1.0 – 1.7 s   text fades out
-   //   1.7 s onward  persistent border only
+   //   3.4 – 4.1 s   image fades out
+   //   4.1 s onward  persistent border only
    const T_TEXT_FADE_IN  = 0.4;
-   const T_TEXT_HOLD_END = 1.0;
+   const T_TEXT_HOLD_END = 3.4;   // was 1.0 — extended to 3 s of hold
    const T_TEXT_FADE_OUT_DUR = 0.7;
    g2Surface.render = function () {
       const ctx = this.getContext(), canvas = this.getCanvas();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
       // ── PREVIEW MODE (no lock yet, but 4 dots tracked) ─────────────────────
-      // Draw a tinted fill between the 4 corners so the user can SEE the
-      // calibration plane in 3D as a solid surface, not 4 floating reticles.
-      // If the fill sits ON the whiteboard, ZONE_SIDE is right; if it floats
-      // in front of or behind the wall, , / . to fix.
+      // Fill a quadrilateral with soft gray so the user can SEE the
+      // calibration plane in 3D as a solid surface. Per the user's
+      // reference sketch, the gray fill IS the depth cue — outlines
+      // are just an accent.
       //
-      // Alpha tuned for depth perception: too transparent and the plane
-      // disappears against busy passthrough; too opaque and it occludes the
-      // physical dots you're trying to align with. ~0.35 is the sweet spot.
+      // Inset from (±1, ±1) — the four cyan reticles sit at exactly ±1
+      // and the inset keeps the gray fill from creeping over the rings
+      // themselves. The reticles are HOLLOW (just an open ring) so the
+      // physical red dots remain visible through them; we only need a
+      // tiny inset (a couple of pixels in canvas space) to keep the fill
+      // from bleeding into the ring stroke. m=0.97 leaves the ring fully
+      // visible while making the preview surface read as "the same area
+      // as the four reticles" — earlier values like 0.78 felt detached
+      // from the dots they were supposed to represent.
       if (surfacePreviewActive && !surfaceActive) {
-         this.setColor([0.0, 0.85, 0.95, 0.35]);
-         this.fillRect(-0.96, -0.96, 1.92, 1.92);
-         // Bright solid perimeter on top so the plane edges read clearly.
-         this.setColor([0.0, 1.0, 0.95, 0.85]);
-         this.lineWidth(0.03);
-         this.drawPath([[-0.96, -0.96], [0.96, -0.96], [0.96, 0.96], [-0.96, 0.96], [-0.96, -0.96]]);
+         const m = 0.97;
+         this.setColor(rgba(UI_PLANE_FILL, 0.30));
+         this.fillRect(-m, -m, 2 * m, 2 * m, UI_CORNER_R * (m / 0.98));
+         // Subtle accent outline with broken corners — only an accent, not
+         // structure. Same treatment as the panel chrome.
+         this.setColor(rgba(UI_ACCENT, 0.55));
+         this.lineWidth(UI_OUTLINE_W);
+         drawBrokenOutline(this, -m, -m, 2 * m, 2 * m, 0.18);
          return;
       }
 
@@ -600,11 +842,13 @@ export const init = async model => {
       if (t < 0) return;
 
       // ── Persistent perimeter ──────────────────────────────────────────────
-      // Brighter than the preview outline. Fades in fast and stays forever.
+      // Thin accent outline with broken corners — fades in fast and stays
+      // for the rest of the session. Same accent treatment as the panels,
+      // for visual consistency across the whole UI.
       const borderAlpha = Math.min(0.85, t * 2.5);
-      this.setColor([0.0, 1.0, 0.9, borderAlpha]);
-      this.lineWidth(0.022);
-      this.drawPath([[-0.96, -0.96], [0.96, -0.96], [0.96, 0.96], [-0.96, 0.96], [-0.96, -0.96]]);
+      this.setColor(rgba(UI_ACCENT, borderAlpha));
+      this.lineWidth(UI_OUTLINE_W);
+      drawBrokenOutline(this, -0.98, -0.98, 1.96, 1.96, 0.22);
 
       // ── LIDAR scan ────────────────────────────────────────────────────────
       if (t <= T_SURFACE_SCAN) {
@@ -623,7 +867,7 @@ export const init = async model => {
                const distanceToWave = maxRadius - dist;
                if (distanceToWave > 0 && distanceToWave < waveGlowSize) {
                   const dotAlpha = (1.0 - (distanceToWave / waveGlowSize)) * pulseAlpha;
-                  this.setColor([0.4, 1.0, 1.0, dotAlpha * 0.9]);
+                  this.setColor(rgba(UI_ACCENT, dotAlpha * 0.9));
                   this.drawPath([[x - crossSize, y], [x + crossSize, y]]);
                   this.drawPath([[x, y - crossSize], [x, y + crossSize]]);
                }
@@ -631,33 +875,44 @@ export const init = async model => {
          }
 
          // Expanding ring
-         this.setColor([0.0, 1.0, 0.9, 0.7 * pulseAlpha]);
+         this.setColor(rgba(UI_ACCENT, 0.7 * pulseAlpha));
          this.lineWidth(0.025);
          this.drawOval(-maxRadius, -maxRadius, maxRadius * 2, maxRadius * 2);
       }
 
-      // ── "MR-andarin" centered intro text — fades in, holds, fades out ─────
+      // ── Axolotl intro image — fades in, holds, fades out ─────
+      // Replaces the previous "MR-andarin" text, which at the chosen
+      // textHeight overflowed the canvas at typical zone sizes — only
+      // "-and" was visible on a 30-cm zone. The image scales to fit
+      // whatever zone size the user has, with aspect ratio preserved.
       const textTotalDur = T_TEXT_HOLD_END + T_TEXT_FADE_OUT_DUR;
-      if (t <= textTotalDur) {
-         let textAlpha;
+      if (t <= textTotalDur && axolotlImage && axolotlImage.complete && axolotlImage.naturalWidth > 0) {
+         let imgAlpha;
          if (t < T_TEXT_FADE_IN) {
-            textAlpha = t / T_TEXT_FADE_IN;          // ease-in (linear is fine)
+            imgAlpha = t / T_TEXT_FADE_IN;          // ease-in (linear is fine)
          } else if (t < T_TEXT_HOLD_END) {
-            textAlpha = 1.0;                         // hold at peak
+            imgAlpha = 1.0;                         // hold at peak
          } else {
-            textAlpha = 1.0 - (t - T_TEXT_HOLD_END) / T_TEXT_FADE_OUT_DUR;
+            imgAlpha = 1.0 - (t - T_TEXT_HOLD_END) / T_TEXT_FADE_OUT_DUR;
          }
-         textAlpha = Math.max(0, Math.min(1, textAlpha));
+         imgAlpha = Math.max(0, Math.min(1, imgAlpha));
 
-         // Soft glow halo behind the text
-         this.setColor([0.0, 1.0, 0.9, textAlpha * 0.4]);
-         this.textHeight(0.55);
-         this.text('MR-andarin', 0, 0, 'center');
+         // Image takes ~70% of the smaller canvas dimension, centered, with
+         // aspect ratio preserved. The zone is square in default (no joystick
+         // resize), so this lands as a square-ish region in the center of
+         // the locked plate. drawImage uses canvas pixel coords directly.
+         const W = canvas.width, H = canvas.height;
+         const target = Math.min(W, H) * 0.70;
+         const imgAspect = axolotlImage.naturalWidth / axolotlImage.naturalHeight;
+         let dw, dh;
+         if (imgAspect >= 1) { dw = target; dh = target / imgAspect; }
+         else                { dh = target; dw = target * imgAspect; }
+         const dx = (W - dw) / 2;
+         const dy = (H - dh) / 2;
 
-         // Bright main text on top
-         this.setColor([0.85, 1.0, 1.0, textAlpha]);
-         this.textHeight(0.5);
-         this.text('MR-andarin', 0, 0, 'center');
+         ctx.globalAlpha = imgAlpha;
+         ctx.drawImage(axolotlImage, dx, dy, dw, dh);
+         ctx.globalAlpha = 1.0;
       }
    };
 
@@ -698,20 +953,43 @@ export const init = async model => {
       const hh = hp;                 // bbox half-height in G2
 
       // ── Phase 1: SPARKS (radial particles flying out from bbox center) ────
+      // Was 8 small sparks (size 0.02), barely visible. Now 16 sparks of
+      // 3× size in two staggered rings — outer ring travels farther, inner
+      // ring smaller and brighter. Reads as a real burst.
       if (t < T_SPARK_DUR) {
          const p = t / T_SPARK_DUR;
-         this.setColor([0.5, 1.0, 1.0, 1.0 - p]);
+         // Outer ring: 8 large sparks, fly far
+         this.setColor(rgba(UI_ACCENT, 1.0 - p));
          for (let i = 0; i < 8; i++) {
             const angle = i * Math.PI / 4;
-            const r = p * 0.4;
-            const x = cx + Math.cos(angle) * r - 0.01;
-            const y = cy + Math.sin(angle) * r - 0.01;
-            this.fillOval(x, y, 0.02, 0.02);
+            const r = p * 0.55;
+            const x = cx + Math.cos(angle) * r;
+            const y = cy + Math.sin(angle) * r;
+            const sz = 0.06 * (1 - p * 0.4);     // shrink slightly as they fade
+            this.fillOval(x - sz/2, y - sz/2, sz, sz);
+         }
+         // Inner ring: 8 medium sparks, offset by half-angle, shorter range
+         this.setColor(rgba(UI_TEXT_PRIMARY, 1.0 - p));
+         for (let i = 0; i < 8; i++) {
+            const angle = (i + 0.5) * Math.PI / 4;
+            const r = p * 0.35;
+            const x = cx + Math.cos(angle) * r;
+            const y = cy + Math.sin(angle) * r;
+            const sz = 0.04 * (1 - p * 0.4);
+            this.fillOval(x - sz/2, y - sz/2, sz, sz);
          }
       }
 
       // ── Phase 2: CARDINAL LINES (extend from bbox edge midpoints) ─────────
       // Lines stay drawn after they finish extending (during panel phase).
+      // Accent color so they're visible against any whiteboard, and thick
+      // enough (0.03) to read as real connection lines, not accidental
+      // crosshair tick marks.
+      //
+      // Line length is proportional to bbox size (HANZI_LINE_FACTOR ×
+      // bboxSide_meters), so a small character gets short lines and a big
+      // character gets longer lines — keeps the cardinal layout visually
+      // balanced regardless of how big the user wrote the hanzi.
       if (t >= T_LINE_START) {
          const lp = Math.min(1, (t - T_LINE_START) / T_LINE_DUR);
 
@@ -721,13 +999,17 @@ export const init = async model => {
          // implies a zone exists, but guards against initialization races).
          const hX = activeZone ? activeZone.halfX : 0.25;
          const hY = activeZone ? activeZone.halfY : 0.25;
-         const lineLenG2_X = HANZI_LINE_LEN / hX;
-         const lineLenG2_Y = HANZI_LINE_LEN / hY;
+         // Bbox size in meters → line length in meters → convert to g2
+         // units per axis (g2 X-unit = hX meters; g2 Y-unit = hY meters).
+         const bboxSideM   = Math.max(wp * 2 * hX, hp * 2 * hY);
+         const lineLenM    = HANZI_LINE_FACTOR * bboxSideM;
+         const lineLenG2_X = lineLenM / hX;
+         const lineLenG2_Y = lineLenM / hY;
          const targetX = lineLenG2_X * lp;
          const targetY = lineLenG2_Y * lp;
 
-         this.setColor([0.0, 1.0, 0.9, 0.8]);
-         this.lineWidth(0.015);
+         this.setColor(rgba(UI_ACCENT, 0.95));
+         this.lineWidth(0.04);
 
          // TOP    — from (cx, cy + hh) upward
          this.drawPath([[cx, cy + hh], [cx, cy + hh + targetY]]);
@@ -750,10 +1032,15 @@ export const init = async model => {
       try {
          const res = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(wikiTerm)}`);
          const data = await res.json();
-         if (data.thumbnail && data.thumbnail.source) {
+         // Wikipedia returns BOTH `thumbnail` (small, ~320px) and
+         // `originalimage` (full-resolution). Prefer `originalimage` for
+         // visual quality; fall back to thumbnail if not present.
+         const imgSrc = (data.originalimage && data.originalimage.source)
+                     || (data.thumbnail     && data.thumbnail.source);
+         if (imgSrc) {
             const img = new Image();
             img.crossOrigin = 'anonymous';
-            img.src = data.thumbnail.source;
+            img.src = imgSrc;
             img.onload = () => { displayImage = img; };
          }
       } catch (e) {
@@ -761,7 +1048,9 @@ export const init = async model => {
       }
 
       try {
-         const prompt = `In 6 words or less, give one factual and memorable sentence about "${wikiTerm}". No metaphors, just a clear memorable fact.`;
+         // 5 words or fewer per spec — short enough that the bottom panel
+         // doesn't need multi-line wrapping at the typical zone size.
+         const prompt = `In 5 words or fewer, give one factual and memorable sentence about "${wikiTerm}". No metaphors, just a clear memorable fact. Output only the sentence, no quotes.`;
          displayAI = await askAI(prompt);
       } catch (e) {
          console.warn('AI fetch failed:', e);
@@ -1364,27 +1653,27 @@ export const init = async model => {
       // ─────────────────────────────────────────────────────────────────────
 
       // The intro animation runs from surfaceStartTime for T_INTRO_TOTAL
-      // seconds (LIDAR scan + "MR-andarin" text fade). Plaques (title,
-      // course info) only enter AFTER the intro is done — bringing them in
-      // earlier competes with the intro for attention and clutters a phase
-      // where the user is just confirming "yes, the zone is in the right
-      // place". They also stay hidden during PREVIEW for the same reason:
-      // calibration is about lining up the plane, not reading metadata.
-      const T_INTRO_TOTAL = T_TEXT_HOLD_END + T_TEXT_FADE_OUT_DUR;   // ≈1.7 s
+      // seconds (LIDAR scan + axolotl image fade). Plaques (title, course
+      // info) only enter AFTER the intro is done — bringing them in earlier
+      // competes with the intro for attention and clutters a phase where the
+      // user is just confirming "yes, the zone is in the right place". They
+      // also stay hidden during PREVIEW for the same reason: calibration is
+      // about lining up the plane, not reading metadata.
+      const T_INTRO_TOTAL = T_TEXT_HOLD_END + T_TEXT_FADE_OUT_DUR;   // ≈4.1 s with the 3-s hold
 
       // Local helper: position the side plaques using a zone matrix + half-sizes.
       // Used only in LOCKED, after the intro animation completes.
       const placePlaques = (Mz, hX, hY) => {
          const zL = ARUCO_Z_LIFT;
-         // Title above the top edge
+         // Title above the top edge, horizontally centered.
          const titleY = hY + PLAQUE_GAP + TITLE_HALF_H;
          placePanelAt(panelTitle,
                       transform(Mz, [0, titleY, zL]),
                       Mz, TITLE_HALF_W, TITLE_HALF_H);
-         // Course-info below the bottom edge
-         const courseY = -hY - PLAQUE_GAP - COURSE_HALF_H;
+         // Course-info to the LEFT of the zone, vertically centered.
+         const courseX = -hX - PLAQUE_GAP - COURSE_HALF_W;
          placePanelAt(panelCourseInfo,
-                      transform(Mz, [0, courseY, zL]),
+                      transform(Mz, [courseX, 0, zL]),
                       Mz, COURSE_HALF_W, COURSE_HALF_H);
       };
 
@@ -1472,8 +1761,12 @@ export const init = async model => {
             const cRight  = [inv[0], inv[1], inv[2]];
             const cUp     = [inv[4], inv[5], inv[6]];
             const cBack   = [inv[8], inv[9], inv[10]];
+            // Headset world position — the [12..14] elements of the
+            // inverseViewMatrix are the camera's world-space origin.
+            // We need this to compute per-corner distance for angular
+            // sizing of each crosshair.
+            const cPos    = [inv[12], inv[13], inv[14]];
             const indicators = [dotInd0, dotInd1, dotInd2, dotInd3];
-            const s = DOT_INDICATOR_HALF;
 
             for (let i = 0; i < 4; i++) {
                const p = corners[i];
@@ -1481,6 +1774,16 @@ export const init = async model => {
                   indicators[i].setMatrix(HIDDEN_MATRIX);
                   continue;
                }
+               // Per-corner world half-size = angular_half × distance.
+               // This keeps each reticle's apparent on-screen size
+               // identical regardless of how far the corner is from
+               // the user — so changing ZONE_SIDE only shifts where
+               // the reticles sit, not how big they look.
+               const dx = p[0] - cPos[0];
+               const dy = p[1] - cPos[1];
+               const dz = p[2] - cPos[2];
+               const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+               const s = DOT_INDICATOR_ANGULAR_HALF * dist;
                indicators[i].setMatrix([
                   cRight[0] * s, cRight[1] * s, cRight[2] * s, 0,
                   cUp[0]    * s, cUp[1]    * s, cUp[2]    * s, 0,
@@ -1506,7 +1809,20 @@ export const init = async model => {
       }
 
       // ── Hanzi VFX + info panels (anchored to bbox within activeZone) ──────
-      const M = localPanelMatrix;
+      // Use the CACHED activeZone.matrix — captured once at lock time. The
+      // alternative was localPanelMatrix, which gets recomputed from the
+      // current viewMatrix every time a character is detected. With small
+      // SQUARE_FL miscalibration and head movement between lock and detect,
+      // localPanelMatrix points at slightly different world positions every
+      // time, which manifested as panels spawning behind the user (in the
+      // direction the user was facing during the most recent OCR frame
+      // rather than on the original whiteboard).
+      //
+      // activeZone.matrix is the SAME matrix that anchors the surface VFX,
+      // the title plaque, the course-info plaque, and the ArUco markers, so
+      // anchoring the hanzi panels to it as well guarantees they all sit on
+      // exactly the same plane in world space.
+      const M = activeZone ? activeZone.matrix : null;
       const haveBbox =
          displayChar &&
          M &&
@@ -1529,35 +1845,56 @@ export const init = async model => {
          const bboxSide     = Math.max(localW, localH);             // square panels per spec
          const halfBbox     = bboxSide / 2;
          const panelHalf    = (HANZI_PANEL_MUL * bboxSide) / 2;
-         const offset       = halfBbox + HANZI_LINE_LEN + panelHalf; // bbox edge → panel center
+         const lineLen      = HANZI_LINE_FACTOR * bboxSide;          // proportional to bbox
+         const offset       = halfBbox + lineLen + panelHalf;        // bbox edge → panel center
 
          // Hanzi VFX panel: same plane & extent as the surface VFX
          const zoneCenter = transform(M, [0, 0, 0]);
          placePanelAt(hanziFXObj, zoneCenter, M, hX, hY);
 
-         // Panel grow animation (ease-out cubic, synced with alpha fade-in)
+         // Per-panel grow animation. Each panel's size goes 0 → panelHalf
+         // over its own T_PANEL_DUR window, with ease-out cubic. They start
+         // staggered so the user sees them appear one at a time:
+         //   meaning  (TOP)    first
+         //   pinyin   (RIGHT)  second
+         //   image    (LEFT)   third
+         //   sentence (BOTTOM) fourth
          const t  = model.time - hanziStartTime;
-         const pp = Math.max(0, Math.min(1, (t - T_PANEL_START) / T_PANEL_DUR));
-         const ease = 1 - Math.pow(1 - pp, 3);
-         const animatedHalf = panelHalf * ease;
+         const grow = (startTime) => {
+            const pp = Math.max(0, Math.min(1, (t - startTime) / T_PANEL_DUR));
+            const ease = 1 - Math.pow(1 - pp, 3);
+            return panelHalf * ease;
+         };
+         const halfMeaning  = grow(T_PANEL_TOP_START);
+         const halfPinyin   = grow(T_PANEL_RIGHT_START);
+         const halfImage    = grow(T_PANEL_LEFT_START);
+         const halfSentence = grow(T_PANEL_BOTTOM_START);
 
-         if (animatedHalf > 0.001) {
-            // Cardinal positions: TOP=meaning, BOTTOM=AI, LEFT=image, RIGHT=pinyin
-            const topPos    = transform(M, [localCenterX, localCenterY + offset, 0]);
-            const bottomPos = transform(M, [localCenterX, localCenterY - offset, 0]);
-            const leftPos   = transform(M, [localCenterX - offset, localCenterY, 0]);
-            const rightPos  = transform(M, [localCenterX + offset, localCenterY, 0]);
+         // Helper: place a panel if it has nonzero size, hide otherwise.
+         //
+         // No clamp: a previous version forced the panel center to stay
+         // inside (zoneHalf − panelHalf − ARUCO_KEEPOUT), which for typical
+         // bboxes pulled all four panels back to a tiny ~5 cm radius around
+         // the zone center — exactly where the hanzi sits. Result: the
+         // panels and lines piled up on top of the character instead of
+         // appearing at the end of each cardinal line. The cardinal layout
+         // (panel directly above / below / left / right of the bbox center)
+         // never overlaps the corner ArUcos when the user writes near the
+         // zone center, so the clamp was solving a problem that didn't
+         // exist while creating the one we just fixed. Trust the math.
+         const placeOrHide = (panel, cx, cy, ah) => {
+            if (ah <= 0.001) {
+               panel.setMatrix(HIDDEN_MATRIX);
+               return;
+            }
+            placePanelAt(panel, transform(M, [cx, cy, 0]), M, ah);
+         };
 
-            placePanelAt(panelMeaning, topPos,    M, animatedHalf);
-            placePanelAt(panelAI,      bottomPos, M, animatedHalf);
-            placePanelAt(panelImage,   leftPos,   M, animatedHalf);
-            placePanelAt(panelPinyin,  rightPos,  M, animatedHalf);
-         } else {
-            panelMeaning.setMatrix(HIDDEN_MATRIX);
-            panelAI.setMatrix(HIDDEN_MATRIX);
-            panelImage.setMatrix(HIDDEN_MATRIX);
-            panelPinyin.setMatrix(HIDDEN_MATRIX);
-         }
+         // Cardinal positions: TOP=meaning, RIGHT=pinyin, LEFT=image, BOTTOM=AI/sentence
+         placeOrHide(panelMeaning, localCenterX,          localCenterY + offset, halfMeaning);
+         placeOrHide(panelPinyin,  localCenterX + offset, localCenterY,          halfPinyin);
+         placeOrHide(panelImage,   localCenterX - offset, localCenterY,          halfImage);
+         placeOrHide(panelAI,      localCenterX,          localCenterY - offset, halfSentence);
       } else {
          hanziFXObj.setMatrix(HIDDEN_MATRIX);
          panelMeaning.setMatrix(HIDDEN_MATRIX);
