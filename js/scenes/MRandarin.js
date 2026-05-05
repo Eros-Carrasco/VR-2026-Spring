@@ -4,6 +4,7 @@ import { G2 } from "../util/g2.js";
 import { askAI } from "../util/aiquery.js";
 import { computeCameraPose } from "../util/computeCameraPose.js";
 import { mxm, transform } from "../util/matrix.js";
+import HanziWriter from "../util/hanzi-writer.esm.js";
 
 window.mandarinState = {
    status: 'empty',
@@ -31,6 +32,16 @@ window.mandarinState = {
    // Synchronized to all clients so the headset can render the pokédex panel
    // without doing its own backend fetch.
    pokedex: { discovered: {}, top100: [] },
+   // Learn-mode target — when non-null, the HanziWriter stroke-order panel
+   // appears in the zone and the OCR uses strict matching against this char
+   // (other recognitions are ignored, no positive feedback). Cleared by
+   // pollServer when the backend responds with target_match=true.
+   //   shape: { char, pinyin, meaning } | null
+   learnTarget: null,
+   // Bumped by any client when the user taps "LEARN A NEW HANZI" in the
+   // pokédex panel. The PC master watches it and fetches a fresh target
+   // from /hanzi/learn_target, then publishes via mandarinState.learnTarget.
+   learnNewCounter: 0,
 };
 
 export const init = async model => {
@@ -359,6 +370,25 @@ export const init = async model => {
    let g2Title      = new G2(false, 1024, 256);   // "MR-andarin" header above the zone
    let g2CourseInfo = new G2();                    // course / instructor / date plaque below
    let g2Pokedex    = new G2();                    // discovered hanzi grid + "learn a new" button (right side)
+   let g2HanziWriter = new G2();                   // HanziWriter stroke-order panel (top-left of the zone)
+
+   // Hidden DOM canvas where the HanziWriter library does its drawing. We
+   // do NOT add it to the document — it's just a rendering target. Each
+   // animation frame, g2HanziWriter.render() blits this canvas onto the
+   // visible MR panel via drawImage. This indirection avoids any conflict
+   // between G2's per-frame clear-and-redraw cycle and HanziWriter's own
+   // requestAnimationFrame-driven canvas updates.
+   const HANZI_WRITER_CANVAS_PX = 256;
+   const hanziWriterCanvas = document.createElement('canvas');
+   hanziWriterCanvas.width  = HANZI_WRITER_CANVAS_PX;
+   hanziWriterCanvas.height = HANZI_WRITER_CANVAS_PX;
+
+   // The active HanziWriter instance. Created lazily the first time
+   // mandarinState.learnTarget transitions to a non-null value, then reused
+   // across target changes via setCharacter(). Stays alive (but not animating)
+   // when learnTarget goes back to null.
+   let hanziWriterInstance = null;
+   let hanziWriterLastChar = null;
 
    // ── Axolotl intro image (replaces "MR-andarin" text in the lock animation) ──
    // Loaded once at init; rendered into g2Surface each frame during the intro
@@ -402,6 +432,7 @@ export const init = async model => {
    model.txtrSrc(13, g2Title.getCanvas());
    model.txtrSrc(14, g2CourseInfo.getCanvas());
    model.txtrSrc(15, g2Pokedex.getCanvas());
+   model.txtrSrc(16, g2HanziWriter.getCanvas());
 
    // ── Render order matters: later .add() calls draw ON TOP of earlier ones ──
    // Stack (bottom → top):
@@ -433,6 +464,7 @@ export const init = async model => {
    let panelTitle      = model.add('square').txtr(13).dull();
    let panelCourseInfo = model.add('square').txtr(14).dull();
    let panelPokedex    = model.add('square').txtr(15).dull();
+   let panelHanziWriter = model.add('square').txtr(16).dull();
 
    // 4. ArUco holograms
    let arucoTL = model.add('square').txtr(0).dull();
@@ -461,6 +493,7 @@ export const init = async model => {
    panelTitle.setMatrix(HIDDEN_MATRIX);
    panelCourseInfo.setMatrix(HIDDEN_MATRIX);
    panelPokedex.setMatrix(HIDDEN_MATRIX);
+   panelHanziWriter.setMatrix(HIDDEN_MATRIX);
    arucoTL.setMatrix(HIDDEN_MATRIX);
    arucoTR.setMatrix(HIDDEN_MATRIX);
    arucoBR.setMatrix(HIDDEN_MATRIX);
@@ -893,6 +926,40 @@ export const init = async model => {
    };
 
    // ─────────────────────────────────────────────────────────────────────────
+   // HANZI WRITER PANEL
+   // ─────────────────────────────────────────────────────────────────────────
+   // Renders the stroke-order animation for the current learn-target hanzi.
+   // Sits in the top-left corner of the active zone (30%×30% of zone). The
+   // backend is told to white-out the same region (`erase_rects` payload in
+   // pollServer) so the OCR ignores this area while the user is writing in
+   // the rest of the zone.
+   //
+   // The HanziWriter library draws into the hidden DOM canvas
+   // hanziWriterCanvas via its own animation loop. This render() copies that
+   // canvas onto the visible g2 surface every frame plus a translucent
+   // background.
+   g2HanziWriter.render = function () {
+      const ctx = this.getContext(), canvas = this.getCanvas();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      // Translucent background, lighter than the other panels so the
+      // animation reads cleanly on top.
+      this.setColor(rgba(UI_PANEL_BG, 0.55));
+      this.fillRect(-0.98, -0.98, 1.96, 1.96, UI_CORNER_R);
+      // Blit the HanziWriter library's canvas onto our visible surface.
+      // Centered with a small margin so the stroke animation has room to
+      // breathe inside the panel.
+      const cw = canvas.width, ch = canvas.height;
+      const margin = 0.10 * cw;
+      try {
+         ctx.drawImage(hanziWriterCanvas, margin, margin,
+                                          cw - 2 * margin, ch - 2 * margin);
+      } catch (e) {
+         // canvas might be in an inconsistent state for one frame after
+         // setCharacter — drop the blit and retry next frame.
+      }
+   };
+
+   // ─────────────────────────────────────────────────────────────────────────
    // SURFACE VFX RENDER
    // ─────────────────────────────────────────────────────────────────────────
    // The G2 canvas spans [-1..1] which maps to the full marker zone (corner
@@ -1300,10 +1367,21 @@ export const init = async model => {
 
          try {
             const base64 = canvas.toDataURL('image/png').split(',')[1];
+            // Build the predict body. If a learn-target is active, tell the
+            // backend to (a) only accept that specific char, and (b) erase
+            // the top-left 30%×30% of the zone where the HanziWriter panel
+            // is rendered — otherwise OCR would see the animated guide as
+            // a real handwritten character.
+            const predictBody = { image: base64 };
+            const _learnTarget = mandarinState.learnTarget;
+            if (_learnTarget && _learnTarget.char) {
+               predictBody.target_char = _learnTarget.char;
+               predictBody.erase_rects = [{ x: 0, y: 0, w: 0.30, h: 0.30 }];
+            }
             const response = await fetch('http://localhost:1111/predict', {
                method: 'POST',
                headers: { 'Content-Type': 'application/json' },
-               body: JSON.stringify({ image: base64 })
+               body: JSON.stringify(predictBody)
             });
             const result = await response.json();
             lastServerResult = result;
@@ -1331,6 +1409,14 @@ export const init = async model => {
                mandarinState.char_y_pct = result.char_y_pct ?? null;
                mandarinState.bbox_w_pct = result.bbox_w_pct ?? null;
                mandarinState.bbox_h_pct = result.bbox_h_pct ?? null;
+               // If this was a learn-target match, clear the target so the
+               // HanziWriter panel disappears and the user can write freely
+               // again. The cardinal feedback panels will fire normally
+               // because mandarinState.character is set.
+               if (result.target_match === true) {
+                  mandarinState.learnTarget = null;
+                  console.log('[MRandarin] learn target completed — clearing.');
+               }
             }
 
             else if (result.erased === true) {
@@ -1377,6 +1463,38 @@ export const init = async model => {
       pollPokedex();                        // fire one immediately so the panel
                                             // populates on first show
       setInterval(pollPokedex, 2000);
+
+      // ── Learn-new watcher (PC master only) ───────────────────────────────
+      // Any client (typically the headset) that taps the "LEARN A NEW HANZI"
+      // button bumps mandarinState.learnNewCounter. The PC master watches
+      // for that bump and fetches a fresh target from /hanzi/learn_target,
+      // then publishes via mandarinState.learnTarget. We use polling instead
+      // of a callback because mandarinState changes propagate via the
+      // synchronize/broadcast loop, not via direct listeners.
+      let lastLearnNewCounter = mandarinState.learnNewCounter || 0;
+      setInterval(async () => {
+         const cur = mandarinState.learnNewCounter || 0;
+         if (cur === lastLearnNewCounter) return;
+         lastLearnNewCounter = cur;
+         try {
+            const exclude = (mandarinState.learnTarget && mandarinState.learnTarget.char) || '';
+            const url = 'http://localhost:1111/hanzi/learn_target'
+                      + (exclude ? '?exclude_char=' + encodeURIComponent(exclude) : '');
+            const resp = await fetch(url);
+            if (!resp.ok) return;
+            const data = await resp.json();
+            if (data && data.char) {
+               mandarinState.learnTarget = {
+                  char:    data.char,
+                  pinyin:  data.pinyin  || '',
+                  meaning: data.meaning || '',
+               };
+               console.log('[MRandarin] new learn target picked:', data.char);
+            }
+         } catch (err) {
+            console.warn('[MRandarin] learn_target fetch failed:', err);
+         }
+      }, 200);
 
       // ── Reset key (R) — clears the current zone & reverts backend state ───
       window.addEventListener('keydown', (e) => {
@@ -1646,10 +1764,27 @@ export const init = async model => {
             if (now - pokedexHitState[hand].lastTap >= POKEDEX_TAP_COOLDOWN) {
                pokedexHitState[hand].lastTap = now;
                if (buttonId === 0) {
+                  // "LEARN A NEW HANZI" — bump the counter; PC master will
+                  // fetch a fresh target from /hanzi/learn_target and publish
+                  // it via mandarinState.learnTarget.
                   console.log('[MRandarin] pokedex tap: button=learn-new (hand=' + hand + ')');
+                  mandarinState.learnNewCounter = (mandarinState.learnNewCounter || 0) + 1;
+                  server.broadcastGlobal('mandarinState');
                } else {
-                  const ch = visibleChars[buttonId - 1] || '?';
-                  console.log('[MRandarin] pokedex tap: button=hanzi[' + (buttonId - 1) + '] char=' + ch + ' (hand=' + hand + ')');
+                  // Tapped on a discovered hanzi cell. Set it directly as
+                  // the new learn-target — no backend round-trip needed
+                  // since the pinyin/meaning are already in the pokédex.
+                  const ch = visibleChars[buttonId - 1];
+                  const entry = ch ? discovered[ch] : null;
+                  if (ch && entry) {
+                     console.log('[MRandarin] pokedex tap: button=hanzi[' + (buttonId - 1) + '] char=' + ch + ' (hand=' + hand + ')');
+                     mandarinState.learnTarget = {
+                        char:    ch,
+                        pinyin:  entry.pinyin  || '',
+                        meaning: entry.meaning || '',
+                     };
+                     server.broadcastGlobal('mandarinState');
+                  }
                }
             }
          }
@@ -1734,6 +1869,7 @@ export const init = async model => {
          panelTitle.setMatrix(HIDDEN_MATRIX);
          panelCourseInfo.setMatrix(HIDDEN_MATRIX);
          panelPokedex.setMatrix(HIDDEN_MATRIX);
+         panelHanziWriter.setMatrix(HIDDEN_MATRIX);
          pokedexHitState.left.wasInside  = -1;
          pokedexHitState.right.wasInside = -1;
       }
@@ -1930,6 +2066,22 @@ export const init = async model => {
          placePanelAt(panelPokedex,
                       transform(Mz, [pokedexX, 0, zL]),
                       Mz, POKEDEX_HALF_W, POKEDEX_HALF_H);
+         // HanziWriter panel — top-left corner of the zone, 30%×30% of
+         // the zone. Only shown when a learn-target is active. Visible
+         // size matches the erase_rect sent in pollServer so the area
+         // covered visually equals the area hidden from OCR.
+         if (mandarinState.learnTarget && mandarinState.learnTarget.char) {
+            const hwHalfW = 0.30 * hX;     // half-width = 30% × hX (i.e. 30% of full zone width × 0.5)
+            const hwHalfH = 0.30 * hY;
+            // Center sits 30% inwards from the top-left corner of the zone.
+            const hwCx = -hX + 0.30 * hX;  // = -0.70 * hX
+            const hwCy = +hY - 0.30 * hY;  // = +0.70 * hY
+            placePanelAt(panelHanziWriter,
+                         transform(Mz, [hwCx, hwCy, zL]),
+                         Mz, hwHalfW, hwHalfH);
+         } else {
+            panelHanziWriter.setMatrix(HIDDEN_MATRIX);
+         }
       };
 
       if (activeZone) {
@@ -1963,6 +2115,7 @@ export const init = async model => {
             panelTitle.setMatrix(HIDDEN_MATRIX);
             panelCourseInfo.setMatrix(HIDDEN_MATRIX);
             panelPokedex.setMatrix(HIDDEN_MATRIX);
+            panelHanziWriter.setMatrix(HIDDEN_MATRIX);
             // Reset hit-test state so a finger that happened to be inside
             // the panel volume during hidden frames doesn't fire a spurious
             // tap when the panel reappears next frame.
@@ -1994,6 +2147,7 @@ export const init = async model => {
          panelTitle.setMatrix(HIDDEN_MATRIX);
          panelCourseInfo.setMatrix(HIDDEN_MATRIX);
          panelPokedex.setMatrix(HIDDEN_MATRIX);
+         panelHanziWriter.setMatrix(HIDDEN_MATRIX);
          pokedexHitState.left.wasInside  = -1;
          pokedexHitState.right.wasInside = -1;
 
@@ -2066,6 +2220,7 @@ export const init = async model => {
          panelTitle.setMatrix(HIDDEN_MATRIX);
          panelCourseInfo.setMatrix(HIDDEN_MATRIX);
          panelPokedex.setMatrix(HIDDEN_MATRIX);
+         panelHanziWriter.setMatrix(HIDDEN_MATRIX);
          pokedexHitState.left.wasInside  = -1;
          pokedexHitState.right.wasInside = -1;
          arucoTL.setMatrix(HIDDEN_MATRIX);
@@ -2176,6 +2331,54 @@ export const init = async model => {
       // panelChar stays hidden by spec
       panelChar.setMatrix(HIDDEN_MATRIX);
 
+      // ── HanziWriter lifecycle ─────────────────────────────────────────────
+      // React to changes in mandarinState.learnTarget. When it transitions to
+      // a new char, point the writer at it (creating one on first use). When
+      // it goes back to null, cancel the running animation. The actual canvas
+      // copy onto the panel happens in g2HanziWriter.render every frame, so
+      // we only need to react to char changes here, not to redraw on every
+      // frame.
+      {
+         const target = mandarinState.learnTarget;
+         const targetChar = (target && target.char) ? target.char : null;
+         if (targetChar !== hanziWriterLastChar) {
+            hanziWriterLastChar = targetChar;
+            if (targetChar) {
+               try {
+                  if (!hanziWriterInstance) {
+                     hanziWriterInstance = HanziWriter.create(hanziWriterCanvas, targetChar, {
+                        renderer: 'canvas',
+                        width:  HANZI_WRITER_CANVAS_PX,
+                        height: HANZI_WRITER_CANVAS_PX,
+                        showOutline: true,
+                        showCharacter: false,
+                        strokeAnimationSpeed: 1,
+                        delayBetweenStrokes: 300,
+                        strokeColor: '#ffffff',
+                        outlineColor: '#888888',
+                     });
+                  } else {
+                     hanziWriterInstance.setCharacter(targetChar);
+                  }
+                  hanziWriterInstance.loopCharacterAnimation();
+               } catch (err) {
+                  console.warn('[MRandarin] HanziWriter setup failed for', targetChar, err);
+               }
+            } else {
+               // Target cleared — cancel the loop. The instance stays alive
+               // and ready to switch chars next time.
+               if (hanziWriterInstance) {
+                  try { hanziWriterInstance.cancelAnimation(); }
+                  catch (err) { /* nothing useful to do */ }
+               }
+               // Also clear the hidden canvas so a stale frame doesn't show
+               // through if the panel reopens before setCharacter completes.
+               const cctx = hanziWriterCanvas.getContext('2d');
+               if (cctx) cctx.clearRect(0, 0, hanziWriterCanvas.width, hanziWriterCanvas.height);
+            }
+         }
+      }
+
       // ── Update G2 canvases ────────────────────────────────────────────────
       g2Surface.update();
       g2HanziFX.update();
@@ -2184,6 +2387,7 @@ export const init = async model => {
       g2Image.update();
       g2AI.update();
       g2Pokedex.update();
+      g2HanziWriter.update();
 
       // ── PC debug overlay update ───────────────────────────────────────────
       if (debugDiv) {
