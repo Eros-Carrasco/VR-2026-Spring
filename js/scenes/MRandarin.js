@@ -378,7 +378,7 @@ export const init = async model => {
    // visible MR panel via drawImage. This indirection avoids any conflict
    // between G2's per-frame clear-and-redraw cycle and HanziWriter's own
    // requestAnimationFrame-driven canvas updates.
-   const HANZI_WRITER_CANVAS_PX = 256;
+   const HANZI_WRITER_CANVAS_PX = 512;
    const hanziWriterCanvas = document.createElement('canvas');
    hanziWriterCanvas.width  = HANZI_WRITER_CANVAS_PX;
    hanziWriterCanvas.height = HANZI_WRITER_CANVAS_PX;
@@ -953,12 +953,12 @@ export const init = async model => {
       // Blit HanziWriter's hidden canvas onto the visible one. We MUST reset
       // the transform first — G2's fillRect leaves a residual scale/translate
       // that would re-map our pixel coords and shrink the image to nothing.
-      const margin = 0.10 * cw;
+      // No internal margin: HanziWriter has its own padding around the char,
+      // adding more here just shrinks the stroke artwork unnecessarily.
       ctx.save();
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       try {
-         ctx.drawImage(hanziWriterCanvas, margin, margin,
-                                          cw - 2 * margin, ch - 2 * margin);
+         ctx.drawImage(hanziWriterCanvas, 0, 0, cw, ch);
       } catch (e) {
          // Canvas might be in an inconsistent state for one frame after
          // setCharacter — drop the blit and retry next frame.
@@ -2365,12 +2365,13 @@ export const init = async model => {
                         renderer: 'canvas',
                         width:  HANZI_WRITER_CANVAS_PX,
                         height: HANZI_WRITER_CANVAS_PX,
-                        showOutline: true,
-                        showCharacter: false,
-                        strokeAnimationSpeed: 1,
-                        delayBetweenStrokes: 300,
-                        strokeColor: '#ffffff',
-                        outlineColor: '#888888',
+                        showOutline:          true,
+                        showCharacter:        false,
+                        strokeColor:          '#90c2ff',
+                        outlineColor:         '#0b0b0b',
+                        strokeAnimationSpeed: 0.55,
+                        delayBetweenStrokes:  600,
+                        delayBetweenLoops:    900,
                      });
                   } else {
                      hanziWriterInstance.setCharacter(targetChar);
