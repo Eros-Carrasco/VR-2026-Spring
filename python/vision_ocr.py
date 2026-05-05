@@ -86,9 +86,24 @@ def lookup_pinyin_and_meaning(char):
         py = '?'
     try:
         definition = _dictionary.definition_lookup(char)
-        # skip surname entries to get the actual meaning
+        # Skip definitions that aren't the "primary" meaning of the character.
+        # Hanzipy frequently returns surname entries, given-name variants, and
+        # references to other characters before the actual semantic definition.
+        # The frontend's panel only shows the first '/'-segment, so when these
+        # entries win they crowd out the real meaning. Filter them out here so
+        # every consumer (predict, pokédex, learn_target) gets a clean answer.
+        _SKIP_PREFIXES = (
+            'surname',
+            '(used in given names)',
+            'variant of',
+            'old variant of',
+            'used in ',
+        )
+        def _is_primary(d):
+            text = d['definition'].lstrip()
+            return not text.startswith(_SKIP_PREFIXES)
         meaning = next(
-            (d['definition'] for d in definition if not d['definition'].startswith('surname')),
+            (d['definition'] for d in definition if _is_primary(d)),
             definition[0]['definition'] if definition else 'unknown'
         )
         meaning = meaning.split('/CL:')[0]

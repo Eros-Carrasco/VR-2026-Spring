@@ -355,10 +355,45 @@ def predict():
         normalized_bgr = normalize_image(bgr, centroids)
         _debug_state['markers_found'] = True
         _debug_state['markers'] = centroids
-        _debug_state['image'] = normalized_bgr.copy()
         ocr_src = normalized_bgr
         ordered = order_corners(centroids)
         src_corners_norm = [[x / img_w, y / img_h] for (x, y) in ordered]
+
+        # ── Optional: erase user-specified rectangles in the warped zone ─────
+        # The frontend can ask the backend to ignore arbitrary regions inside
+        # the workspace by sending `erase_rects`: a list of {x, y, w, h} in
+        # zone-relative percentages [0..1], where (0,0) is the top-left of the
+        # 800×800 warped zone and (1,1) is the bottom-right. We paint those
+        # rectangles solid white BEFORE the contrast boost / OCR pass, so
+        # Vision never sees whatever was there.
+        #
+        # The intended use is to hide the HanziWriter stroke-order panel that
+        # the headset renders on top of the physical workspace during learn
+        # mode — without this, Vision would happily recognize the animated
+        # guide as a real handwritten character and trigger a false detection.
+        erase_rects = data.get('erase_rects') or []
+        if erase_rects:
+            zone_left_int = int(img_w / 2 - 400)
+            zone_top_int  = int(img_h / 2 - 400)
+            for r in erase_rects:
+                try:
+                    rx = float(r.get('x', 0))
+                    ry = float(r.get('y', 0))
+                    rw = float(r.get('w', 0))
+                    rh = float(r.get('h', 0))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                px1 = zone_left_int + int(max(0.0, min(1.0, rx))      * 800)
+                py1 = zone_top_int  + int(max(0.0, min(1.0, ry))      * 800)
+                px2 = zone_left_int + int(max(0.0, min(1.0, rx + rw)) * 800)
+                py2 = zone_top_int  + int(max(0.0, min(1.0, ry + rh)) * 800)
+                if px2 > px1 and py2 > py1:
+                    cv2.rectangle(normalized_bgr, (px1, py1), (px2, py2),
+                                  (255, 255, 255), -1)
+
+        # Capture the debug image AFTER any erase passes so /debug shows the
+        # exact same pixels OCR is about to see.
+        _debug_state['image'] = normalized_bgr.copy()
 
         # Contrast enhancement — boosts stroke visibility for OCR
         enhanced = cv2.convertScaleAbs(ocr_src, alpha=1.5, beta=0)
@@ -499,6 +534,32 @@ def predict():
 
         char, confidence, bb, bbox_pixels = accepted
         bx, by, bw, bh = bbox_pixels
+
+        # ── Optional: strict target-char gate (learn mode) ───────────────────
+        # If the frontend passed `target_char`, only proceed to lock-on when
+        # the recognized character matches. Otherwise we tell the frontend
+        # what we saw via target_mismatch but stay in the unlocked state, so
+        # the next frame's OCR runs normally. This implements the "strict
+        # learn mode" — the user must write the requested character; writing
+        # something else is silently ignored (no positive feedback, no
+        # pokédex addition, no panels).
+        target_char = data.get('target_char')
+        if target_char and char != target_char:
+            _log_event({
+                'event': 'predict',
+                'phase': 'target_mismatch',
+                'state': _state,
+                'target_char': target_char,
+                'seen_char': char,
+                'confidence': round(float(confidence), 3),
+                'observations': log_observations,
+            })
+            return jsonify({
+                'character': None,
+                'target_mismatch': char,
+                'src_corners': _src_corners_payload(centroids, img_w, img_h),
+            })
+
         py, meaning = lookup_pinyin_and_meaning(char)
 
         # Normalized position within the 800×800 detection zone
@@ -544,6 +605,7 @@ def predict():
             'bbox_h_pct':  round(bbox_h_pct, 4),
             # Marker corners [TL, TR, BR, BL] in original image space, normalized 0-1
             'src_corners': [[round(x, 4), round(y, 4)] for (x, y) in src_corners_norm] if src_corners_norm else None,
+            'target_match': bool(target_char),
         })
 
     except Exception as e:
