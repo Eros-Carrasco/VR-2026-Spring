@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import atexit
 import base64
 import json
@@ -95,6 +97,19 @@ _SESSION_DIR = Path(os.environ.get('MRANDARIN_SESSION_DIR', 'mrandarin_sessions'
 _session_file = None
 _session_path = None
 
+# ── Pokédex persistence ─────────────────────────────────────────────────────
+# Tracks which hanzi the user has discovered across all sessions. Lives at
+# mrandarin_sessions/discovered_hanzi.json so it survives server restarts but
+# can be reset by deleting the file. Schema is intentionally minimal:
+#   {char: {pinyin, meaning, first_seen, times_seen, last_seen}}
+_DISCOVERED_PATH = _SESSION_DIR / 'discovered_hanzi.json'
+
+# Top 100 most frequent simplified hanzi, used to pick targets in learn mode.
+# Loaded once at startup from python/top100_hanzi.txt — keep that file as the
+# single source of truth so the list is editable without touching code.
+_TOP100_PATH = Path(__file__).parent / 'top100_hanzi.txt'
+_top100 = []
+
 # ── Per-session frame capture ────────────────────────────────────────────────
 # When SAVE_FRAMES=1 (default), every image sent to run_vision_ocr is written
 # to mrandarin_sessions/session_<ts>/frame_NNNN.png. These are the exact
@@ -152,6 +167,69 @@ def _close_session_file():
             _session_file.close()
         except Exception:
             pass
+
+
+def _load_top100():
+    """Load the top-100 hanzi list from disk into the module-level _top100."""
+    global _top100
+    try:
+        text = _TOP100_PATH.read_text(encoding='utf-8')
+        _top100 = [line.strip() for line in text.splitlines() if line.strip()]
+        print(f'[pokedex] loaded {len(_top100)} hanzi from {_TOP100_PATH}')
+    except Exception as e:
+        print(f'[pokedex] failed to load top100: {e}')
+        _top100 = []
+
+
+def _read_discovered():
+    """Read the discovered hanzi map from disk. Returns {} on any failure."""
+    if not _DISCOVERED_PATH.exists():
+        return {}
+    try:
+        with open(_DISCOVERED_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f'[pokedex] failed to read {_DISCOVERED_PATH}: {e}')
+        return {}
+
+
+def _write_discovered(data):
+    """Atomically write the discovered hanzi map to disk."""
+    try:
+        _SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _DISCOVERED_PATH.with_suffix('.json.tmp')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp.replace(_DISCOVERED_PATH)
+    except Exception as e:
+        print(f'[pokedex] failed to write {_DISCOVERED_PATH}: {e}')
+
+
+def _record_discovery(char, pinyin, meaning):
+    """Record a recognized hanzi in the pokédex. Increments times_seen if
+    already known, creates the entry if new. Logged to stdout but never
+    raises — must NOT break the /predict response."""
+    try:
+        data = _read_discovered()
+        now = datetime.now().isoformat(timespec='seconds')
+        if char in data:
+            data[char]['times_seen'] = data[char].get('times_seen', 0) + 1
+            data[char]['last_seen']  = now
+            data[char]['pinyin']     = pinyin    # refresh in case lookup improved
+            data[char]['meaning']    = meaning
+        else:
+            data[char] = {
+                'pinyin':     pinyin,
+                'meaning':    meaning,
+                'first_seen': now,
+                'last_seen':  now,
+                'times_seen': 1,
+            }
+            print(f'[pokedex] new discovery: {char} ({pinyin}) — {meaning}')
+        _write_discovered(data)
+    except Exception as e:
+        print(f'[pokedex] _record_discovery failed: {e}')
+
 
 # State machine: 'SEARCHING_RED' uses HSV red-dot detection (default at
 # startup and after /reset); 'TRACKING_ARUCO' uses ArUco IDs 0-3 (entered
@@ -433,6 +511,7 @@ def predict():
         bbox_h_pct = max(0.0, min(1.0, bh / 800))
 
         print(f'recognized: {char} {py} - {meaning} (confidence: {confidence:.2f})')
+        _record_discovery(char, py, meaning)
         _debug_state['character'] = char
         _debug_state['confidence'] = round(float(confidence), 2)
         _debug_state['locked'] = True
@@ -813,9 +892,50 @@ def clear_images():
     return jsonify({'deleted': deleted, 'dir': str(_session_image_dir)})
 
 
+@app.route('/hanzi', methods=['GET'])
+def hanzi_list():
+    """Return the pokédex contents plus the top-100 list.
+
+    Frontend calls this periodically to keep the pokédex panel in sync.
+    Response shape:
+      {
+        "discovered": {char: {pinyin, meaning, first_seen, last_seen, times_seen}},
+        "top100": [char, char, ...]
+      }
+    """
+    return jsonify({
+        'discovered': _read_discovered(),
+        'top100':     _top100,
+    })
+
+@app.route('/hanzi/learn_target', methods=['GET'])
+def hanzi_learn_target():
+    """Pick a hanzi from top100 that the user has NOT yet discovered.
+
+    Optional query param `exclude_char` lets the frontend ask for a different
+    one than what was just shown (e.g. user pressed 'Learn a new' twice).
+    Falls back to a random top100 char if everything is already discovered.
+    Returns: {"char": "你", "pinyin": "nǐ", "meaning": "you"}
+    """
+    import random
+    exclude = request.args.get('exclude_char', '')
+    discovered = _read_discovered()
+    candidates = [c for c in _top100 if c not in discovered and c != exclude]
+    if not candidates:
+        # Either everything is discovered or only the excluded one is left.
+        # Pick anything from top100 except the exclude.
+        candidates = [c for c in _top100 if c != exclude] or _top100
+    if not candidates:
+        return jsonify({'char': None, 'error': 'top100 list is empty'})
+    char = random.choice(candidates)
+    py, meaning = lookup_pinyin_and_meaning(char)
+    return jsonify({'char': char, 'pinyin': py, 'meaning': meaning})
+
+
 if __name__ == '__main__':
     # Open the first session log file before the server starts accepting
     # requests, so we have a valid handle on the very first /predict.
+    _load_top100()
     _open_new_session_file()
     print('MRandarin Vision Server starting on port 1111...')
     print(f'  • OCR confidence threshold: {OCR_CONFIDENCE_THRESHOLD}')
