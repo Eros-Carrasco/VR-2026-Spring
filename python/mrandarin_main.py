@@ -95,8 +95,17 @@ _SESSION_DIR = Path(os.environ.get('MRANDARIN_SESSION_DIR', 'mrandarin_sessions'
 _session_file = None
 _session_path = None
 
+# ── Per-session frame capture ────────────────────────────────────────────────
+# When SAVE_FRAMES=1 (default), every image sent to run_vision_ocr is written
+# to mrandarin_sessions/session_<ts>/frame_NNNN.png. These are the exact
+# contrast-enhanced crops that Apple Vision receives — useful for offline
+# model comparisons. Set SAVE_FRAMES=0 to disable.
+SAVE_FRAMES = os.environ.get('MRANDARIN_SAVE_FRAMES', '1') == '1'
+_session_image_dir: Path | None = None
+_frame_counter = 0
+
 def _open_new_session_file():
-    global _session_file, _session_path
+    global _session_file, _session_path, _session_image_dir, _frame_counter
     if _session_file is not None:
         try:
             _session_file.close()
@@ -107,7 +116,22 @@ def _open_new_session_file():
     _session_path = _SESSION_DIR / f'session_{ts}.jsonl'
     # Line-buffered so each write hits disk immediately.
     _session_file = open(_session_path, 'a', buffering=1, encoding='utf-8')
+    _frame_counter = 0
+    _session_image_dir = _SESSION_DIR / f'session_{ts}'
+    if SAVE_FRAMES:
+        _session_image_dir.mkdir(parents=True, exist_ok=True)
     print(f'[session] logging to {_session_path}')
+    if SAVE_FRAMES:
+        print(f'[session] saving frames to {_session_image_dir}/')
+
+def _save_ocr_frame(image_bgr):
+    """Save the image being sent to Vision OCR as a numbered PNG in the session folder."""
+    global _frame_counter
+    if not SAVE_FRAMES or _session_image_dir is None:
+        return
+    _frame_counter += 1
+    path = _session_image_dir / f'frame_{_frame_counter:04d}.png'
+    cv2.imwrite(str(path), image_bgr)
 
 def _log_event(event):
     """Append one event dict to the session log as a JSON line."""
@@ -261,6 +285,7 @@ def predict():
         # Contrast enhancement — boosts stroke visibility for OCR
         enhanced = cv2.convertScaleAbs(ocr_src, alpha=1.5, beta=0)
         ocr_bytes = bgr_to_png_bytes(enhanced)
+        _save_ocr_frame(enhanced)
 
         _debug_state['character'] = None
         _debug_state['confidence'] = None
@@ -747,12 +772,54 @@ def health():
     return jsonify({'status': 'ok'})
 
 
+@app.route('/session_images', methods=['GET'])
+def session_images():
+    """List all frame PNGs saved in the current session's image folder.
+
+    Returns metadata so the caller can decide which frames to fetch or copy.
+    """
+    if not SAVE_FRAMES:
+        return jsonify({'enabled': False, 'frames': []})
+    if _session_image_dir is None or not _session_image_dir.exists():
+        return jsonify({'enabled': True, 'dir': None, 'frames': [], 'count': 0})
+    frames = sorted(p.name for p in _session_image_dir.glob('frame_*.png'))
+    return jsonify({
+        'enabled': True,
+        'dir': str(_session_image_dir),
+        'count': len(frames),
+        'frames': frames,
+    })
+
+
+@app.route('/clear_images', methods=['POST'])
+def clear_images():
+    """Delete all frame PNGs from the current session's image folder.
+
+    Call this after copying the frames to your other repo. The session log
+    (.jsonl) is NOT deleted — only the image files.
+    """
+    if not SAVE_FRAMES or _session_image_dir is None:
+        return jsonify({'deleted': 0, 'dir': None})
+    if not _session_image_dir.exists():
+        return jsonify({'deleted': 0, 'dir': str(_session_image_dir)})
+    deleted = 0
+    for p in list(_session_image_dir.glob('frame_*.png')):
+        try:
+            p.unlink()
+            deleted += 1
+        except Exception as e:
+            print(f'[clear_images] could not delete {p}: {e}')
+    print(f'[clear_images] deleted {deleted} frames from {_session_image_dir}')
+    return jsonify({'deleted': deleted, 'dir': str(_session_image_dir)})
+
+
 if __name__ == '__main__':
     # Open the first session log file before the server starts accepting
     # requests, so we have a valid handle on the very first /predict.
     _open_new_session_file()
     print('MRandarin Vision Server starting on port 1111...')
     print(f'  • OCR confidence threshold: {OCR_CONFIDENCE_THRESHOLD}')
+    print(f'  • Save frames:              {"yes → " + str(_session_image_dir) if SAVE_FRAMES else "no (MRANDARIN_SAVE_FRAMES=0)"}')
     print(f'  • Session log:              {_session_path}')
     print(f'  • View log live:            http://localhost:1111/session_log')
     app.run(host='0.0.0.0', port=1111, debug=False)

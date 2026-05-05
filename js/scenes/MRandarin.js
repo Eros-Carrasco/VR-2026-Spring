@@ -1009,7 +1009,7 @@ export const init = async model => {
          const targetY = lineLenG2_Y * lp;
 
          this.setColor(rgba(UI_ACCENT, 0.95));
-         this.lineWidth(0.04);
+         this.lineWidth(0.02);
 
          // TOP    — from (cx, cy + hh) upward
          this.drawPath([[cx, cy + hh], [cx, cy + hh + targetY]]);
