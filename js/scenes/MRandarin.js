@@ -486,6 +486,28 @@ export const init = async model => {
    let hanziActive     = false;     // true while a character is being shown
    let hanziStartTime  = 9999.0;    // model.time when current character first appeared
 
+   // ── Pokédex hit-test state ───────────────────────────────────────────────
+   // Per-hand finger-touch state for the pokédex panel buttons. Each entry
+   // tracks which button id (or -1 for "outside") the finger was over in the
+   // PREVIOUS frame, plus a timestamp of the last triggered tap to enforce
+   // a 300ms cooldown. A "tap" fires on the transition from -1 → button_id,
+   // not on continuous presence inside the button — that way holding the
+   // finger near the panel doesn't trigger repeat clicks.
+   //
+   // Button id convention:
+   //   -1   = finger outside any button (or outside panel volume entirely)
+   //    0   = "LEARN A NEW HANZI" button (always present)
+   //    1+  = grid cell index + 1 (so id=1 is hanzi[0], id=2 is hanzi[1], …)
+   // We avoid id=0 collision by reserving 0 for the always-on button.
+   const POKEDEX_TAP_COOLDOWN = 0.3;          // seconds
+   const POKEDEX_Z_TOUCH      = 0.10;         // meters — finger must be within
+                                              // 10 cm of the panel's plane to
+                                              // count as touching
+   let pokedexHitState = {
+      left:  { wasInside: -1, lastTap: -1 },
+      right: { wasInside: -1, lastTap: -1 },
+   };
+
    // ── PC-only debug overlay (created later if we are master) ────────────────
    let debugDiv = null;             // HTML <div> shown on the PC window
    let lastServerResult = null;     // last raw response from /predict
@@ -1527,6 +1549,114 @@ export const init = async model => {
       ]);
    }
 
+   // ── Pokédex hit-test helper ──────────────────────────────────────────────
+   // Given the active zone matrix Mz and the user's half-extents (hX, hY),
+   // figure out for each hand which pokédex button (if any) the finger is
+   // inside. Logs a tap event when a finger transitions from outside → a
+   // button (with the cooldown gate). Hooked up in Fase 5 to actually drive
+   // the learn-target state — for now this only logs to console.
+   //
+   // Math: the pokédex panel is positioned by placePanelAt with the same
+   // structure each frame. We reconstruct its local frame on the fly:
+   //   xAxis = Mz_x · POKEDEX_HALF_W      (column 0 of placePanelAt's matrix)
+   //   yAxis = Mz_y · POKEDEX_HALF_H      (column 1)
+   //   zAxis = Mz_z                       (column 2, unscaled)
+   //   pos   = transform(Mz, [pokedexX, 0, ARUCO_Z_LIFT])
+   // To invert (world→local) we project onto the orthonormal Mz_{x,y,z}:
+   //   local.x = ((finger - pos) · Mz_x) / POKEDEX_HALF_W
+   //   local.y = ((finger - pos) · Mz_y) / POKEDEX_HALF_H
+   //   local.z = (finger - pos) · Mz_z          (unitary, no scale)
+   // local.x and local.y end up in g2 canvas units [-1..+1] iff finger is
+   // physically inside the panel rectangle. local.z is meters away from the
+   // plane (sign depends on which side; we just check |z|).
+   function pokedexHitTest(Mz, hX) {
+      const pokedexX_world = +hX + PLAQUE_GAP + POKEDEX_HALF_W;
+      const pos = transform(Mz, [pokedexX_world, 0, ARUCO_Z_LIFT]);
+      // Mz columns 0/1/2 are x/y/z axes (Mz is row-major flat-16; column k
+      // starts at index 4*k for k=0..3). Indices: x=0,1,2; y=4,5,6; z=8,9,10.
+      const Mzx = [Mz[0], Mz[1], Mz[2]];
+      const Mzy = [Mz[4], Mz[5], Mz[6]];
+      const Mzz = [Mz[8], Mz[9], Mz[10]];
+
+      // Geometry of the pokédex render — these MUST match what
+      // g2Pokedex.render draws. If you change the layout in render,
+      // change them here too.
+      const POKEDEX_BTN_RECT = { x: -0.78, y: -0.95, w: 1.56, h: 0.23 };
+      const POKEDEX_GRID_TOP = 0.65;
+      const POKEDEX_GRID_COLS    = 2;
+      const POKEDEX_GRID_ROWS    = 7;
+      const POKEDEX_GRID_BOTTOM  = -0.60;
+      const POKEDEX_GRID_CELL_W  = 1.7 / POKEDEX_GRID_COLS;          // ≈0.85
+      const POKEDEX_GRID_CELL_H  = (POKEDEX_GRID_TOP - POKEDEX_GRID_BOTTOM)
+                                 / POKEDEX_GRID_ROWS;                // ≈0.18
+      const POKEDEX_GRID_X_CENTERS = [-0.425, +0.425];
+
+      const inRect = (x, y, rx, ry, rw, rh) =>
+         x >= rx && x <= rx + rw && y >= ry && y <= ry + rh;
+
+      const discovered = (mandarinState.pokedex && mandarinState.pokedex.discovered) || {};
+      const visibleChars = Object.keys(discovered).slice(0, 14);  // mirror POKEDEX_MAX_CELLS
+
+      for (const hand of ['left', 'right']) {
+         const fp = inputEvents.pos(hand);
+         if (!fp) {
+            pokedexHitState[hand].wasInside = -1;
+            continue;
+         }
+         const dx = fp[0] - pos[0];
+         const dy = fp[1] - pos[1];
+         const dz = fp[2] - pos[2];
+         const localX = (dx * Mzx[0] + dy * Mzx[1] + dz * Mzx[2]) / POKEDEX_HALF_W;
+         const localY = (dx * Mzy[0] + dy * Mzy[1] + dz * Mzy[2]) / POKEDEX_HALF_H;
+         const localZ = (dx * Mzz[0] + dy * Mzz[1] + dz * Mzz[2]);
+
+         let buttonId = -1;
+
+         if (Math.abs(localZ) <= POKEDEX_Z_TOUCH &&
+             localX >= -1 && localX <= 1 && localY >= -1 && localY <= 1) {
+            // Finger is in the panel's local volume. Check the buttons.
+            // 1) Learn-new button
+            if (inRect(localX, localY,
+                       POKEDEX_BTN_RECT.x, POKEDEX_BTN_RECT.y,
+                       POKEDEX_BTN_RECT.w, POKEDEX_BTN_RECT.h)) {
+               buttonId = 0;
+            } else {
+               // 2) Grid cells (only those with a discovered hanzi)
+               for (let i = 0; i < visibleChars.length; i++) {
+                  const col = i % POKEDEX_GRID_COLS;
+                  const row = Math.floor(i / POKEDEX_GRID_COLS);
+                  const cx  = POKEDEX_GRID_X_CENTERS[col];
+                  const cyTop = POKEDEX_GRID_TOP - row * POKEDEX_GRID_CELL_H;
+                  const rx = cx - POKEDEX_GRID_CELL_W / 2;
+                  const ry = cyTop - POKEDEX_GRID_CELL_H;
+                  if (inRect(localX, localY,
+                             rx, ry,
+                             POKEDEX_GRID_CELL_W, POKEDEX_GRID_CELL_H)) {
+                     buttonId = i + 1;   // reserve 0 for learn-new
+                     break;
+                  }
+               }
+            }
+         }
+
+         const prev = pokedexHitState[hand].wasInside;
+         if (prev === -1 && buttonId !== -1) {
+            // Outside → inside: this is a tap candidate.
+            const now = model.time;
+            if (now - pokedexHitState[hand].lastTap >= POKEDEX_TAP_COOLDOWN) {
+               pokedexHitState[hand].lastTap = now;
+               if (buttonId === 0) {
+                  console.log('[MRandarin] pokedex tap: button=learn-new (hand=' + hand + ')');
+               } else {
+                  const ch = visibleChars[buttonId - 1] || '?';
+                  console.log('[MRandarin] pokedex tap: button=hanzi[' + (buttonId - 1) + '] char=' + ch + ' (hand=' + hand + ')');
+               }
+            }
+         }
+         pokedexHitState[hand].wasInside = buttonId;
+      }
+   }
+
    // ── Right-thumbstick reader ────────────────────────────────────────────
    // Returns [dx, dy] in [-1, 1] for the right Quest controller's stick.
    // dy is flipped so that "stick up" is positive. PC/desktop returns [0, 0].
@@ -1604,6 +1734,8 @@ export const init = async model => {
          panelTitle.setMatrix(HIDDEN_MATRIX);
          panelCourseInfo.setMatrix(HIDDEN_MATRIX);
          panelPokedex.setMatrix(HIDDEN_MATRIX);
+         pokedexHitState.left.wasInside  = -1;
+         pokedexHitState.right.wasInside = -1;
       }
 
       // ── Lock signal — capture activeZone (all clients) + switch backend (PC only) ──
@@ -1824,10 +1956,18 @@ export const init = async model => {
          const introT = surfaceActive ? (model.time - surfaceStartTime) : Infinity;
          if (introT >= T_INTRO_TOTAL) {
             placePlaques(Mz, hX, hY);
+            // Pokédex finger hit-test (only when the panel is visible).
+            // Logs taps; the actions are connected in Fase 5.
+            pokedexHitTest(Mz, hX);
          } else {
             panelTitle.setMatrix(HIDDEN_MATRIX);
             panelCourseInfo.setMatrix(HIDDEN_MATRIX);
             panelPokedex.setMatrix(HIDDEN_MATRIX);
+            // Reset hit-test state so a finger that happened to be inside
+            // the panel volume during hidden frames doesn't fire a spurious
+            // tap when the panel reappears next frame.
+            pokedexHitState.left.wasInside  = -1;
+            pokedexHitState.right.wasInside = -1;
          }
 
          // Hide per-dot indicators — they belong to the pre-lock phase only.
@@ -1854,6 +1994,8 @@ export const init = async model => {
          panelTitle.setMatrix(HIDDEN_MATRIX);
          panelCourseInfo.setMatrix(HIDDEN_MATRIX);
          panelPokedex.setMatrix(HIDDEN_MATRIX);
+         pokedexHitState.left.wasInside  = -1;
+         pokedexHitState.right.wasInside = -1;
 
          if (!previewPose) {
             // PnP failed (degenerate quad, NaN, …). Hide all preview visuals
@@ -1924,6 +2066,8 @@ export const init = async model => {
          panelTitle.setMatrix(HIDDEN_MATRIX);
          panelCourseInfo.setMatrix(HIDDEN_MATRIX);
          panelPokedex.setMatrix(HIDDEN_MATRIX);
+         pokedexHitState.left.wasInside  = -1;
+         pokedexHitState.right.wasInside = -1;
          arucoTL.setMatrix(HIDDEN_MATRIX);
          arucoTR.setMatrix(HIDDEN_MATRIX);
          arucoBR.setMatrix(HIDDEN_MATRIX);
