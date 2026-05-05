@@ -26,6 +26,11 @@ window.mandarinState = {
    char_y_pct: null,
    bbox_w_pct: null,
    bbox_h_pct: null,
+   // Pokédex state — populated by the PC master from periodic GET /hanzi.
+   // Shape: { discovered: {char: {pinyin, meaning, ...}}, top100: [chars] }
+   // Synchronized to all clients so the headset can render the pokédex panel
+   // without doing its own backend fetch.
+   pokedex: { discovered: {}, top100: [] },
 };
 
 export const init = async model => {
@@ -122,6 +127,10 @@ export const init = async model => {
    const TITLE_HALF_H    = 0.045;  //  9 cm tall
    const COURSE_HALF_W   = 0.085;  // 17 cm wide  — narrow vertical strip
    const COURSE_HALF_H   = 0.13;   // 26 cm tall  — fits 4 stacked lines
+   // Pokédex plaque — same dimensions as COURSE for visual symmetry. Lives on
+   // the RIGHT side of the zone, mirrored against the course-info on the LEFT.
+   const POKEDEX_HALF_W  = 0.085;  // 17 cm wide
+   const POKEDEX_HALF_H  = 0.13;   // 26 cm tall
    const PLAQUE_GAP      = 0.05;   // 5 cm gap between plaque and zone edge.
                                    // Previously 2.5 cm, but the corner ArUcos
                                    // (3 cm side) sit right at the zone corners
@@ -349,6 +358,7 @@ export const init = async model => {
    //    4:1 canvas maps onto a 4:1 panel with no stretch.
    let g2Title      = new G2(false, 1024, 256);   // "MR-andarin" header above the zone
    let g2CourseInfo = new G2();                    // course / instructor / date plaque below
+   let g2Pokedex    = new G2();                    // discovered hanzi grid + "learn a new" button (right side)
 
    // ── Axolotl intro image (replaces "MR-andarin" text in the lock animation) ──
    // Loaded once at init; rendered into g2Surface each frame during the intro
@@ -391,6 +401,7 @@ export const init = async model => {
    model.txtrSrc(12, g2DotIndicator.getCanvas());
    model.txtrSrc(13, g2Title.getCanvas());
    model.txtrSrc(14, g2CourseInfo.getCanvas());
+   model.txtrSrc(15, g2Pokedex.getCanvas());
 
    // ── Render order matters: later .add() calls draw ON TOP of earlier ones ──
    // Stack (bottom → top):
@@ -421,6 +432,7 @@ export const init = async model => {
    // 3. Always-on plaques
    let panelTitle      = model.add('square').txtr(13).dull();
    let panelCourseInfo = model.add('square').txtr(14).dull();
+   let panelPokedex    = model.add('square').txtr(15).dull();
 
    // 4. ArUco holograms
    let arucoTL = model.add('square').txtr(0).dull();
@@ -448,6 +460,7 @@ export const init = async model => {
    panelMeaning.setMatrix(HIDDEN_MATRIX);
    panelTitle.setMatrix(HIDDEN_MATRIX);
    panelCourseInfo.setMatrix(HIDDEN_MATRIX);
+   panelPokedex.setMatrix(HIDDEN_MATRIX);
    arucoTL.setMatrix(HIDDEN_MATRIX);
    arucoTR.setMatrix(HIDDEN_MATRIX);
    arucoBR.setMatrix(HIDDEN_MATRIX);
@@ -775,6 +788,87 @@ export const init = async model => {
       }
    };
    g2CourseInfo.update();
+
+   // ─────────────────────────────────────────────────────────────────────────
+   // POKÉDEX PLAQUE
+   // ─────────────────────────────────────────────────────────────────────────
+   // Mirror of COURSE-INFO but on the right side of the zone. Renders a grid
+   // of hanzi the user has discovered, plus a "learn a new hanzi" button at
+   // the bottom. Each grid cell shows the character on top and its pinyin
+   // smaller below. Per the user's spec: meaning is NOT shown here — it lives
+   // in the cardinal feedback panels.
+   //
+   // Re-rendered every frame (g2Pokedex.update() is in the animate loop) so
+   // newly discovered hanzi appear without needing a manual refresh.
+   //
+   // Layout (g2 canvas units, [-1..+1] both axes, top is +1):
+   //   y ∈ [+0.78, +0.92]   header  "POKÉDEX"
+   //   y ∈ [-0.65, +0.70]   grid    2 cols × up to 7 rows  (max 14 cells visible)
+   //   y ∈ [-0.95, -0.72]   button  "LEARN A NEW HANZI"  (rounded rect)
+   //
+   // Limit of 14 visible cells matches what the panel can comfortably hold at
+   // this size. The user is aware they shouldn't exceed it during the demo.
+   // (Scrolling is a future improvement, not Fase 3.)
+   const POKEDEX_MAX_CELLS = 14;
+   g2Pokedex.render = function () {
+      const ctx = this.getContext(), canvas = this.getCanvas();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Background — same translucent fill as the other plaques.
+      this.setColor(rgba(UI_PANEL_BG, 0.45));
+      this.fillRect(-0.98, -0.98, 1.96, 1.96, UI_CORNER_R);
+
+      // Header
+      this.setColor(rgba(UI_ACCENT, 0.95));
+      fitText(this, 'POKÉDEX', 1.7, 0.13);
+      this.text('POKÉDEX', 0, 0.85, 'center');
+
+      // Pull discovered hanzi from synchronized state — both PC and headset
+      // read the same source of truth.
+      const discovered = (mandarinState.pokedex && mandarinState.pokedex.discovered) || {};
+      const chars = Object.keys(discovered);
+      const visible = chars.slice(0, POKEDEX_MAX_CELLS);
+
+      // Grid layout
+      const gridTop    = 0.65;
+      const gridBottom = -0.60;
+      const cols       = 2;
+      const rows       = Math.ceil(POKEDEX_MAX_CELLS / cols);  // 7
+      const cellW      = 1.7 / cols;                            // ≈0.85
+      const cellH      = (gridTop - gridBottom) / rows;         // ≈0.18
+      const xCenters   = [-0.425, +0.425];                      // 2 columns centered
+
+      for (let i = 0; i < visible.length; i++) {
+         const ch = visible[i];
+         const entry = discovered[ch] || {};
+         const col = i % cols;
+         const row = Math.floor(i / cols);
+         const cx  = xCenters[col];
+         const cyTop = gridTop - row * cellH;
+         const charY   = cyTop - 0.04;
+         const pinyinY = cyTop - 0.13;
+
+         // Character — large
+         this.setColor(rgba(UI_TEXT_PRIMARY, 1.0));
+         this.textHeight(0.085);
+         this.text(ch, cx, charY, 'center');
+
+         // Pinyin — smaller, accent color
+         const pyText = entry.pinyin || '';
+         this.setColor(rgba(UI_ACCENT, 0.85));
+         this.textHeight(0.045);
+         this.text(pyText, cx, pinyinY, 'center');
+      }
+
+      // "LEARN A NEW HANZI" button — visual only in this phase. Filled
+      // rounded rect with text on top. Hit-testing is added in Fase 4.
+      const btnX = -0.78, btnY = -0.95, btnW = 1.56, btnH = 0.23;
+      this.setColor(rgba(UI_ACCENT, 0.30));
+      this.fillRect(btnX, btnY, btnW, btnH, 0.08);
+      this.setColor(rgba(UI_TEXT_PRIMARY, 0.95));
+      fitText(this, 'LEARN A NEW HANZI', btnW * 0.92, 0.085);
+      this.text('LEARN A NEW HANZI', 0, btnY + btnH * 0.5, 'center');
+   };
 
    // ─────────────────────────────────────────────────────────────────────────
    // SURFACE VFX RENDER
@@ -1240,6 +1334,28 @@ export const init = async model => {
 
       setInterval(pollServer, 500);
 
+      // ── Periodic poll of GET /hanzi (PC master only) ─────────────────────
+      // Every 2 seconds the PC fetches the pokédex contents from the backend
+      // and broadcasts via mandarinState.pokedex. Other clients (the headset)
+      // pick it up automatically through the existing synchronize/broadcast
+      // pair at the top of the animate loop. Independent of /predict polling.
+      async function pollPokedex() {
+         try {
+            const resp = await fetch('http://localhost:1111/hanzi');
+            if (!resp.ok) return;
+            const data = await resp.json();
+            mandarinState.pokedex = {
+               discovered: data.discovered || {},
+               top100:     data.top100 || [],
+            };
+         } catch (err) {
+            // Silent on network errors — the panel just won't update this tick.
+         }
+      }
+      pollPokedex();                        // fire one immediately so the panel
+                                            // populates on first show
+      setInterval(pollPokedex, 2000);
+
       // ── Reset key (R) — clears the current zone & reverts backend state ───
       window.addEventListener('keydown', (e) => {
          if (e.key !== 'r' && e.key !== 'R') return;
@@ -1487,6 +1603,7 @@ export const init = async model => {
          dotInd3.setMatrix(HIDDEN_MATRIX);
          panelTitle.setMatrix(HIDDEN_MATRIX);
          panelCourseInfo.setMatrix(HIDDEN_MATRIX);
+         panelPokedex.setMatrix(HIDDEN_MATRIX);
       }
 
       // ── Lock signal — capture activeZone (all clients) + switch backend (PC only) ──
@@ -1675,6 +1792,12 @@ export const init = async model => {
          placePanelAt(panelCourseInfo,
                       transform(Mz, [courseX, 0, zL]),
                       Mz, COURSE_HALF_W, COURSE_HALF_H);
+         // Pokédex to the RIGHT of the zone, vertically centered. Mirror
+         // image of the course-info plaque.
+         const pokedexX = +hX + PLAQUE_GAP + POKEDEX_HALF_W;
+         placePanelAt(panelPokedex,
+                      transform(Mz, [pokedexX, 0, zL]),
+                      Mz, POKEDEX_HALF_W, POKEDEX_HALF_H);
       };
 
       if (activeZone) {
@@ -1704,6 +1827,7 @@ export const init = async model => {
          } else {
             panelTitle.setMatrix(HIDDEN_MATRIX);
             panelCourseInfo.setMatrix(HIDDEN_MATRIX);
+            panelPokedex.setMatrix(HIDDEN_MATRIX);
          }
 
          // Hide per-dot indicators — they belong to the pre-lock phase only.
@@ -1729,6 +1853,7 @@ export const init = async model => {
          // Plaques never show in preview.
          panelTitle.setMatrix(HIDDEN_MATRIX);
          panelCourseInfo.setMatrix(HIDDEN_MATRIX);
+         panelPokedex.setMatrix(HIDDEN_MATRIX);
 
          if (!previewPose) {
             // PnP failed (degenerate quad, NaN, …). Hide all preview visuals
@@ -1798,6 +1923,7 @@ export const init = async model => {
          surfaceObj.setMatrix(HIDDEN_MATRIX);
          panelTitle.setMatrix(HIDDEN_MATRIX);
          panelCourseInfo.setMatrix(HIDDEN_MATRIX);
+         panelPokedex.setMatrix(HIDDEN_MATRIX);
          arucoTL.setMatrix(HIDDEN_MATRIX);
          arucoTR.setMatrix(HIDDEN_MATRIX);
          arucoBR.setMatrix(HIDDEN_MATRIX);
@@ -1913,6 +2039,7 @@ export const init = async model => {
       g2Meaning.update();
       g2Image.update();
       g2AI.update();
+      g2Pokedex.update();
 
       // ── PC debug overlay update ───────────────────────────────────────────
       if (debugDiv) {
