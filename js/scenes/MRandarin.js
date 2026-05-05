@@ -864,7 +864,7 @@ export const init = async model => {
    // Limit of 14 visible cells matches what the panel can comfortably hold at
    // this size. The user is aware they shouldn't exceed it during the demo.
    // (Scrolling is a future improvement, not Fase 3.)
-   const POKEDEX_MAX_CELLS = 14;
+   const POKEDEX_MAX_CELLS = 8;     // 2 cols × 4 rows — generous vertical spacing
    g2Pokedex.render = function () {
       const ctx = this.getContext(), canvas = this.getCanvas();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -876,7 +876,7 @@ export const init = async model => {
       // Header
       this.setColor(rgba(UI_ACCENT, 0.95));
       fitText(this, 'POKÉDEX', 1.7, 0.13);
-      this.text('POKÉDEX', 0, 0.85, 'center');
+      this.text('POKÉDEX', 0, 0.75, 'center');
 
       // Pull discovered hanzi from synchronized state — both PC and headset
       // read the same source of truth.
@@ -884,13 +884,13 @@ export const init = async model => {
       const chars = Object.keys(discovered);
       const visible = chars.slice(0, POKEDEX_MAX_CELLS);
 
-      // Grid layout
-      const gridTop    = 0.65;
-      const gridBottom = -0.60;
+      // Grid layout — fewer cells with double the vertical spacing per cell.
+      const gridTop    = 0.55;
+      const gridBottom = -0.65;
       const cols       = 2;
-      const rows       = Math.ceil(POKEDEX_MAX_CELLS / cols);  // 7
+      const rows       = Math.ceil(POKEDEX_MAX_CELLS / cols);  // 4
       const cellW      = 1.7 / cols;                            // ≈0.85
-      const cellH      = (gridTop - gridBottom) / rows;         // ≈0.18
+      const cellH      = (gridTop - gridBottom) / rows;         // 0.30
       const xCenters   = [-0.425, +0.425];                      // 2 columns centered
 
       for (let i = 0; i < visible.length; i++) {
@@ -940,23 +940,30 @@ export const init = async model => {
    // background.
    g2HanziWriter.render = function () {
       const ctx = this.getContext(), canvas = this.getCanvas();
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      // Translucent background, lighter than the other panels so the
-      // animation reads cleanly on top.
+      const cw = canvas.width, ch = canvas.height;
+      // Save state + reset transform so clearRect operates in raw pixels
+      // regardless of any transform G2 applied while drawing other panels.
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, cw, ch);
+      ctx.restore();
+      // Translucent background — drawn through G2's coordinate system [-1..+1].
       this.setColor(rgba(UI_PANEL_BG, 0.55));
       this.fillRect(-0.98, -0.98, 1.96, 1.96, UI_CORNER_R);
-      // Blit the HanziWriter library's canvas onto our visible surface.
-      // Centered with a small margin so the stroke animation has room to
-      // breathe inside the panel.
-      const cw = canvas.width, ch = canvas.height;
+      // Blit HanziWriter's hidden canvas onto the visible one. We MUST reset
+      // the transform first — G2's fillRect leaves a residual scale/translate
+      // that would re-map our pixel coords and shrink the image to nothing.
       const margin = 0.10 * cw;
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
       try {
          ctx.drawImage(hanziWriterCanvas, margin, margin,
                                           cw - 2 * margin, ch - 2 * margin);
       } catch (e) {
-         // canvas might be in an inconsistent state for one frame after
+         // Canvas might be in an inconsistent state for one frame after
          // setCharacter — drop the blit and retry next frame.
       }
+      ctx.restore();
    };
 
    // ─────────────────────────────────────────────────────────────────────────
@@ -1376,7 +1383,12 @@ export const init = async model => {
             const _learnTarget = mandarinState.learnTarget;
             if (_learnTarget && _learnTarget.char) {
                predictBody.target_char = _learnTarget.char;
-               predictBody.erase_rects = [{ x: 0, y: 0, w: 0.30, h: 0.30 }];
+               // Erase rectangle mirrors the visible HanziWriter panel: top-right
+               // corner of the zone, 30%×30%, with the same 3% inset. The zone
+               // origin (0,0) is top-left in the warped 800×800 image, so:
+               //   x = 1 - 0.03 - 0.30 = 0.67
+               //   y = 0.03            (3% from the top)
+               predictBody.erase_rects = [{ x: 0.67, y: 0.03, w: 0.30, h: 0.30 }];
             }
             const response = await fetch('http://localhost:1111/predict', {
                method: 'POST',
@@ -2066,16 +2078,19 @@ export const init = async model => {
          placePanelAt(panelPokedex,
                       transform(Mz, [pokedexX, 0, zL]),
                       Mz, POKEDEX_HALF_W, POKEDEX_HALF_H);
-         // HanziWriter panel — top-left corner of the zone, 30%×30% of
-         // the zone. Only shown when a learn-target is active. Visible
-         // size matches the erase_rect sent in pollServer so the area
-         // covered visually equals the area hidden from OCR.
+         // HanziWriter panel — top-RIGHT corner of the zone, 30%×30% of the
+         // zone, with a 3% inset from each edge so it doesn't touch the
+         // ArUco markers. Only shown when a learn-target is active. The
+         // erase_rect sent in pollServer mirrors this geometry so the OCR
+         // ignores exactly the pixels we cover visually.
          if (mandarinState.learnTarget && mandarinState.learnTarget.char) {
-            const hwHalfW = 0.30 * hX;     // half-width = 30% × hX (i.e. 30% of full zone width × 0.5)
+            const hwHalfW = 0.30 * hX;            // 30% of full zone width × 0.5
             const hwHalfH = 0.30 * hY;
-            // Center sits 30% inwards from the top-left corner of the zone.
-            const hwCx = -hX + 0.30 * hX;  // = -0.70 * hX
-            const hwCy = +hY - 0.30 * hY;  // = +0.70 * hY
+            // 3% inset on the top and right edges. Center sits at:
+            //   x = +hX - 0.03 * hX - hwHalfW = (1 - 0.03 - 0.30) * hX = +0.67 * hX
+            //   y = +hY - 0.03 * hY - hwHalfH = (1 - 0.03 - 0.30) * hY = +0.67 * hY
+            const hwCx = +0.67 * hX;
+            const hwCy = +0.67 * hY;
             placePanelAt(panelHanziWriter,
                          transform(Mz, [hwCx, hwCy, zL]),
                          Mz, hwHalfW, hwHalfH);
