@@ -42,6 +42,13 @@ window.mandarinState = {
    // pokédex panel. The PC master watches it and fetches a fresh target
    // from /hanzi/learn_target, then publishes via mandarinState.learnTarget.
    learnNewCounter: 0,
+   // True when the PC is currently seeing all 4 ArUco markers in the cast
+   // image. Updated only on transitions (see pollServer) so other clients
+   // don't get spammed with re-broadcasts. The headset shows it in the left
+   // info panel as a diagnostic — if the user writes a hanzi and nothing
+   // happens, this tells them whether the problem is "I'm not detecting
+   // your markers" vs "your character was not recognized as a known hanzi".
+   fourMarkersDetected: false,
 };
 
 export const init = async model => {
@@ -782,67 +789,55 @@ export const init = async model => {
       this.setColor(rgba(UI_PANEL_BG, 0.45));
       this.fillRect(-0.98, -0.98, 1.96, 1.96, UI_CORNER_R);
 
-      // Three label/value pairs, stacked vertically. DATE row removed per
-      // spec — it was the least useful piece of info on the plaque and
-      // its presence forced 4 rows into the same vertical space, making
-      // each value crowd the label of the row below.
-      //
-      // Layout for 3 rows (canvas height 2.0, usable ~1.6 from -0.8..+0.8):
-      //   - rowH = 0.55 (vs old 0.42 for 4 rows)
-      //   - labelToValueGap = 0.22 (label sits ABOVE its value within the row)
-      //   - This leaves rowH - labelToValueGap = 0.33 between a value's
-      //     bottom and the next label's top, plenty of breathing room.
-      const entries = [
-         ['STUDENT',    'Eros Carrasco'],
-         ['COURSE',     'CSCI-GA 3033'],
-         ['INSTRUCTOR', 'Kenneth Perlin'],
-      ];
+      // ── Live counters + diagnostic ────────────────────────────────────────
+      // Two info rows + axolotl image. Replaces the old student/course/
+      // instructor block which was static and irrelevant during the actual
+      // experience. Counter is read from the synced pokédex map; the lock
+      // diagnostic mirrors mandarinState.fourMarkersDetected (updated by
+      // the PC master in pollServer on transitions only).
+      const discoveredCount = ((mandarinState.pokedex && mandarinState.pokedex.discovered)
+                              ? Object.keys(mandarinState.pokedex.discovered).length
+                              : 0);
+      const fourOK = !!mandarinState.fourMarkersDetected;
 
-      // Find a single value-textHeight that fits the longest VALUE so all
-      // value rows render at the same size. Then a smaller label-textHeight
-      // for all labels.
-      const longestValue = entries.reduce(
-         (max, [_, v]) => v.length > max.length ? v : max, ''
-      );
-      // Probe value size first — capped LOWER than before (0.18 → 0.13)
-      // because at the old size the value occupied so much vertical room
-      // that consecutive rows visually touched. 0.13 leaves clear gaps.
-      const VALUE_MAX_H = 0.13;
-      const valueH = (() => {
-         const ctx2 = this.getContext();
-         const safe = 1.7 * 0.90;
-         for (let h = VALUE_MAX_H; h >= 0.07; h -= 0.01) {
-            this.textHeight(h);
-            const w = ctx2.measureText(longestValue).width / canvas.width * 2;
-            if (w <= safe) return h;
+      // Row 1: hanzi count.
+      this.setColor(rgba(UI_ACCENT, 0.95));
+      this.textHeight(0.085);
+      this.text('HANZI DISCOVERED', 0, 0.85, 'center');
+      this.setColor(rgba(UI_TEXT_PRIMARY, 1.0));
+      this.textHeight(0.20);
+      this.text(String(discoveredCount), 0, 0.65, 'center');
+
+      // Row 2: 4-aruco detection diagnostic.
+      this.setColor(rgba(UI_ACCENT, 0.95));
+      this.textHeight(0.075);
+      this.text('AREA LOCKED IN', 0, 0.40, 'center');
+      this.setColor(fourOK ? [0.4, 0.95, 0.5, 1.0] : [0.95, 0.45, 0.45, 1.0]);
+      this.textHeight(0.13);
+      this.text(fourOK ? 'TRUE' : 'FALSE', 0, 0.22, 'center');
+
+      // Row 3: axolotl image. Reuses the asset already loaded for the intro
+      // animation. We bypass G2's coord system (drawImage uses pixel coords),
+      // resetting the transform exactly like the HanziWriter blit does.
+      try {
+         if (axolotlImage && axolotlImage.complete && axolotlImage.naturalWidth > 0) {
+            const cw = canvas.width, ch = canvas.height;
+            ctx.save();
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            // Bottom portion of the panel, centered. Square-ish region.
+            const imgSize = cw * 0.72;
+            const imgX = (cw - imgSize) / 2;
+            const imgY = ch * 0.58;
+            ctx.drawImage(axolotlImage, imgX, imgY, imgSize, imgSize);
+            ctx.restore();
          }
-         return 0.07;
-      })();
-      // Labels sit slightly smaller than values — small uppercase caption
-      // style. 0.65× factor preserved from the old 4-row layout.
-      const labelH = Math.max(0.07, valueH * 0.65);
-
-      // Render rows with comfortable spacing. Centered vertically:
-      //   first row starts at +0.65, last row ends near -0.65 → ~1.3 of
-      //   1.6 usable height, leaving ~0.15 padding top and bottom.
-      const topY    = 0.65;
-      const rowH    = 0.55;
-      const labelToValueGap = 0.22;
-      for (let i = 0; i < entries.length; i++) {
-         const [label, value] = entries[i];
-         const yLabel = topY - i * rowH;
-         const yValue = yLabel - labelToValueGap;
-
-         this.setColor(rgba(UI_ACCENT, 0.95));
-         this.textHeight(labelH);
-         this.text(label, 0, yLabel, 'center');
-
-         this.setColor(rgba(UI_TEXT_PRIMARY, 1.0));
-         this.textHeight(valueH);
-         this.text(value, 0, yValue, 'center');
+      } catch (e) {
+         // Image not loaded yet — try again next frame.
       }
    };
-   g2CourseInfo.update();
+   // No g2CourseInfo.update() at init anymore — the panel is dynamic now
+   // (live counter + lock indicator), so it must be redrawn every frame.
+   // The update call lives in the animate loop below.
 
    // ─────────────────────────────────────────────────────────────────────────
    // POKÉDEX PLAQUE
@@ -1384,11 +1379,12 @@ export const init = async model => {
             if (_learnTarget && _learnTarget.char) {
                predictBody.target_char = _learnTarget.char;
                // Erase rectangle mirrors the visible HanziWriter panel: top-right
-               // corner of the zone, 30%×30%, with the same 3% inset. The zone
-               // origin (0,0) is top-left in the warped 800×800 image, so:
-               //   x = 1 - 0.03 - 0.30 = 0.67
-               //   y = 0.03            (3% from the top)
-               predictBody.erase_rects = [{ x: 0.67, y: 0.03, w: 0.30, h: 0.30 }];
+               // corner of the zone, 30%×30%, with a 15% inset to stay clear of
+               // the ArUco markers. Zone origin (0,0) is top-left in the warped
+               // 800×800 image, so:
+               //   x = 1 - 0.15 - 0.30 = 0.55
+               //   y = 0.15            (15% from the top)
+               predictBody.erase_rects = [{ x: 0.55, y: 0.15, w: 0.30, h: 0.30 }];
             }
             const response = await fetch('http://localhost:1111/predict', {
                method: 'POST',
@@ -1407,6 +1403,17 @@ export const init = async model => {
                mandarinState.srcCorners = result.src_corners;
                mandarinState.frameW = frameW;
                mandarinState.frameH = frameH;
+            }
+
+            // Update fourMarkersDetected ONLY on transitions, so the headset
+            // gets a single re-broadcast per state change instead of one
+            // broadcast per /predict response. The backend sends src_corners
+            // exactly when it sees a valid 4-marker quad, so its presence is
+            // the truth signal we mirror.
+            const seeingFour = !!result.src_corners;
+            if (seeingFour !== mandarinState.fourMarkersDetected) {
+               mandarinState.fourMarkersDetected = seeingFour;
+               server.broadcastGlobal('mandarinState');
             }
 
             if (result.character) {
@@ -1584,7 +1591,17 @@ export const init = async model => {
    }
 
    // ── ALL CLIENTS ───────────────────────────────────────────────────────────
-   let lastCharacter = undefined;
+   // Initialize from current synced state, NOT from undefined. mandarinState
+   // is persisted by the framework across PC restarts — when the scene reloads
+   // there can be a stale character/pinyin/meaning from a previous session
+   // sitting in mandarinState.* . Starting lastCharacter at undefined would
+   // make the != check fire on frame one ("人" !== undefined → true), which
+   // re-triggers hanziActive and replays the full feedback animation for a
+   // character the user didn't actually write. Adopting the current value as
+   // our baseline means we only react to FUTURE changes, not stale ones.
+   let lastCharacter = (typeof mandarinState.character !== 'undefined')
+                       ? mandarinState.character
+                       : undefined;
    let lastFetchedMeaning = null;
    let lastViewMatrix = null;
    let localPanelMatrix = null;       // recomputed when a new character is detected (uses LOCAL viewMatrix)
@@ -2086,11 +2103,12 @@ export const init = async model => {
          if (mandarinState.learnTarget && mandarinState.learnTarget.char) {
             const hwHalfW = 0.30 * hX;            // 30% of full zone width × 0.5
             const hwHalfH = 0.30 * hY;
-            // 3% inset on the top and right edges. Center sits at:
-            //   x = +hX - 0.03 * hX - hwHalfW = (1 - 0.03 - 0.30) * hX = +0.67 * hX
-            //   y = +hY - 0.03 * hY - hwHalfH = (1 - 0.03 - 0.30) * hY = +0.67 * hY
-            const hwCx = +0.67 * hX;
-            const hwCy = +0.67 * hY;
+            // 15% inset on the top and right edges to keep clear distance
+            // from the ArUco markers (which sit right at the corners). Center:
+            //   x = +hX - 0.15 * hX - hwHalfW = (1 - 0.15 - 0.30) * hX = +0.55 * hX
+            //   y = +hY - 0.15 * hY - hwHalfH = (1 - 0.15 - 0.30) * hY = +0.55 * hY
+            const hwCx = +0.55 * hX;
+            const hwCy = +0.55 * hY;
             placePanelAt(panelHanziWriter,
                          transform(Mz, [hwCx, hwCy, zL]),
                          Mz, hwHalfW, hwHalfH);
@@ -2402,6 +2420,7 @@ export const init = async model => {
       g2Meaning.update();
       g2Image.update();
       g2AI.update();
+      g2CourseInfo.update();
       g2Pokedex.update();
       g2HanziWriter.update();
 
