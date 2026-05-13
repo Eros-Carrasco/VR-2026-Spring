@@ -53,6 +53,59 @@ window.mandarinState = {
 
 export const init = async model => {
 
+   // ── window.requestAnimationFrame shim para WebXR ──────────────────────
+   // window.rAF queda pausado en sesiones XR inmersivas en Quest. Cualquier
+   // librería que dependa de él (HanziWriter, etc.) se congela. Encolamos
+   // sus callbacks y las drenamos desde model.animate, que sí tickea via
+   // xrSession.requestAnimationFrame.
+   const _rafQueue   = new Set();
+   const _origRAF    = window.requestAnimationFrame.bind(window);
+   const _origCAF    = window.cancelAnimationFrame.bind(window);
+   const _origIds    = new Map();
+   let   _rafCounter = 0;
+
+   window.requestAnimationFrame = (cb) => {
+      const id = ++_rafCounter;
+      let fired = false;
+      const wrapper = (t) => {
+         if (fired) return;
+         fired = true;
+         _rafQueue.delete(entry);
+         _origIds.delete(id);
+         try { cb(t); } catch (e) { console.warn('[rAF shim] callback threw:', e); }
+      };
+      const entry = { id, wrapper };
+      _rafQueue.add(entry);
+      _origIds.set(id, _origRAF(wrapper));
+      return id;
+   };
+
+   window.cancelAnimationFrame = (id) => {
+      for (const e of _rafQueue) if (e.id === id) { _rafQueue.delete(e); break; }
+      const origId = _origIds.get(id);
+      if (origId !== undefined) { _origCAF(origId); _origIds.delete(id); }
+   };
+
+   let _draining = false;
+   const drainRaf = () => {
+      // En desktop/web mode, native window.rAF ya maneja todo (incluido el
+      // WebXR polyfill, que lo usa como driver de frames). Drenar acá causa
+      // recursión: drainRaf → polyfill onDeviceFrame → model.animate → drainRaf.
+      // Solo drenamos cuando hay sesión XR real activa.
+      if (typeof isXR !== 'function' || !isXR()) return;
+      // Belt-and-suspenders: aunque el gate de isXR debería bastar, si por
+      // alguna razón nos re-entran (drainRaf → cb → ... → drainRaf), cortamos.
+      if (_draining) return;
+      if (_rafQueue.size === 0) return;
+      _draining = true;
+      try {
+         const t = performance.now();
+         for (const entry of Array.from(_rafQueue)) entry.wrapper(t);
+      } finally {
+         _draining = false;
+      }
+   };
+
    global.scene().addNode(new Gltf2Node({ url: "" })).name = "backGround";
 
    // Oculta el esqueleto de manos y desactiva el pinch-2 (pulgar-dedo medio) de teletransporte
@@ -427,7 +480,7 @@ export const init = async model => {
    model.txtrSrc(1, '../media/mrandarin/ArUco_1.png');
    model.txtrSrc(2, '../media/mrandarin/ArUco_2.png');
    model.txtrSrc(3, '../media/mrandarin/ArUco_3.png');
-   model.txtrSrc(4,  g2Char.getCanvas());
+   model.txtrSrc(4,  g2HanziWriter.getCanvas());  // slot 4 reused — g2Char is permanently hidden
    model.txtrSrc(5,  g2Pinyin.getCanvas());
    model.txtrSrc(6,  g2Image.getCanvas());
    model.txtrSrc(7,  g2AI.getCanvas());
@@ -439,7 +492,6 @@ export const init = async model => {
    model.txtrSrc(13, g2Title.getCanvas());
    model.txtrSrc(14, g2CourseInfo.getCanvas());
    model.txtrSrc(15, g2Pokedex.getCanvas());
-   model.txtrSrc(16, g2HanziWriter.getCanvas());
 
    // ── Render order matters: later .add() calls draw ON TOP of earlier ones ──
    // Stack (bottom → top):
@@ -459,7 +511,7 @@ export const init = async model => {
    let hanziFXObj = model.add('square').txtr(10).dull();
 
    // 2. Info panels (transient — show on character detection)
-   let panelChar    = model.add('square').txtr(4).dull();
+   let panelChar    = model.add('square').dull();           // permanently hidden, no texture slot needed
    let panelPinyin  = model.add('square').txtr(5).dull();
    let panelImage   = model.add('square').txtr(6).dull();
    let panelAI      = model.add('square').txtr(7).dull();
@@ -471,7 +523,7 @@ export const init = async model => {
    let panelTitle      = model.add('square').txtr(13).dull();
    let panelCourseInfo = model.add('square').txtr(14).dull();
    let panelPokedex    = model.add('square').txtr(15).dull();
-   let panelHanziWriter = model.add('square').txtr(16).dull();
+   let panelHanziWriter = model.add('square').txtr(4).dull();
 
    // 4. ArUco holograms
    let arucoTL = model.add('square').txtr(0).dull();
@@ -1849,6 +1901,7 @@ export const init = async model => {
    }
 
    model.animate(() => {
+      drainRaf();
       mandarinState = server.synchronize('mandarinState');
       if (clientID == clients[0]) {
          server.broadcastGlobal('mandarinState');
@@ -2390,11 +2443,19 @@ export const init = async model => {
                         strokeAnimationSpeed: 0.55,
                         delayBetweenStrokes:  600,
                         delayBetweenLoops:    900,
+                        onLoadCharDataSuccess: () => {
+                           try { hanziWriterInstance.loopCharacterAnimation(); }
+                           catch (e) { console.warn('[MRandarin] loopCharacterAnimation failed:', e); }
+                        },
+                        onLoadCharDataError: (err) => {
+                           console.warn('[MRandarin] HanziWriter data load failed for', targetChar, err);
+                        },
                      });
                   } else {
-                     hanziWriterInstance.setCharacter(targetChar);
+                     hanziWriterInstance.setCharacter(targetChar)
+                        .then(() => hanziWriterInstance.loopCharacterAnimation())
+                        .catch(err => console.warn('[MRandarin] setCharacter failed:', err));
                   }
-                  hanziWriterInstance.loopCharacterAnimation();
                } catch (err) {
                   console.warn('[MRandarin] HanziWriter setup failed for', targetChar, err);
                }

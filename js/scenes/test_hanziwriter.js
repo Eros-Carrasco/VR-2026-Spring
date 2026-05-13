@@ -7,6 +7,60 @@ import HanziWriter from "../util/hanzi-writer.esm.js";
 // panel, the library + the blit pipeline both work.
 
 export const init = async model => {
+
+   // ── window.requestAnimationFrame shim para WebXR ──────────────────────
+   // window.rAF queda pausado en sesiones XR inmersivas en Quest. Cualquier
+   // librería que dependa de él (HanziWriter, etc.) se congela. Encolamos
+   // sus callbacks y las drenamos desde model.animate, que sí tickea via
+   // xrSession.requestAnimationFrame.
+   const _rafQueue   = new Set();
+   const _origRAF    = window.requestAnimationFrame.bind(window);
+   const _origCAF    = window.cancelAnimationFrame.bind(window);
+   const _origIds    = new Map();
+   let   _rafCounter = 0;
+
+   window.requestAnimationFrame = (cb) => {
+      const id = ++_rafCounter;
+      let fired = false;
+      const wrapper = (t) => {
+         if (fired) return;
+         fired = true;
+         _rafQueue.delete(entry);
+         _origIds.delete(id);
+         try { cb(t); } catch (e) { console.warn('[rAF shim] callback threw:', e); }
+      };
+      const entry = { id, wrapper };
+      _rafQueue.add(entry);
+      _origIds.set(id, _origRAF(wrapper));
+      return id;
+   };
+
+   window.cancelAnimationFrame = (id) => {
+      for (const e of _rafQueue) if (e.id === id) { _rafQueue.delete(e); break; }
+      const origId = _origIds.get(id);
+      if (origId !== undefined) { _origCAF(origId); _origIds.delete(id); }
+   };
+
+   let _draining = false;
+   const drainRaf = () => {
+      // En desktop/web mode, native window.rAF ya maneja todo (incluido el
+      // WebXR polyfill, que lo usa como driver de frames). Drenar acá causa
+      // recursión: drainRaf → polyfill onDeviceFrame → model.animate → drainRaf.
+      // Solo drenamos cuando hay sesión XR real activa.
+      if (typeof isXR !== 'function' || !isXR()) return;
+      // Belt-and-suspenders: aunque el gate de isXR debería bastar, si por
+      // alguna razón nos re-entran (drainRaf → cb → ... → drainRaf), cortamos.
+      if (_draining) return;
+      if (_rafQueue.size === 0) return;
+      _draining = true;
+      try {
+         const t = performance.now();
+         for (const entry of Array.from(_rafQueue)) entry.wrapper(t);
+      } finally {
+         _draining = false;
+      }
+   };
+
    // Visible G2 panel
    let g2 = new G2();
    model.txtrSrc(2, g2.getCanvas());
@@ -56,6 +110,7 @@ export const init = async model => {
    };
 
    model.animate(() => {
+      drainRaf();
       g2.update();
    });
 };
