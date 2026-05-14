@@ -406,7 +406,7 @@ function _openCalibrationPopup(M) {
 
    for (const { id, cx, cy } of corners) {
       const img = d.createElement('img');
-      img.src = `../media/mrandarin/ArUco_${id}.png`;
+      img.src = `../media/aruco_markers/aruco_${id}.png`;
       img.style.cssText = [
          'position:fixed',
          `left:${cx - half}px`,
