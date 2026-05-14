@@ -81,8 +81,10 @@ window.anchorState = window.anchorState || {
    frameW:          0,       // capture frame width in pixels
    frameH:          0,       // capture frame height in pixels
    fl:              0.340,   // focal length used for the solve
-   width:           0.520,   // real-world width  of the popup rectangle (m)
-   height:          0.290,   // real-world height of the popup rectangle (m)
+   width:           0.520,   // real-world width  of the popup window (m) — full edge-to-edge
+   height:          0.290,   // real-world height of the popup window (m) — full edge-to-edge
+   effectiveWidth:  null,    // marker-center-to-marker-center width  (m) — what the solver actually sees
+   effectiveHeight: null,    // marker-center-to-marker-center height (m) — what the solver actually sees
    calibrated:      false,   // set true once the headset locks a matrix
    recalibCounter:  0,       // bumped by R-key to force re-solve on all clients
 };
@@ -194,12 +196,29 @@ function _startSyncLoop(isMaster) {
 
          // First-time solve on this client (typically the headset) once we
          // see corners. The matrix is then frozen in world space.
+         //
+         // Two distinct sizes are at play here, and the distinction matters:
+         //   - `width` / `height` are the FULL WINDOW dimensions (what the
+         //     user typed into the sliders, what they'd measure with a ruler
+         //     against the popup's outer edges).
+         //   - `effectiveWidth` / `effectiveHeight` are the rectangle between
+         //     ArUco CENTERS — smaller than the window by one marker side on
+         //     each axis. This is what the solver actually sees in the image,
+         //     because cv2.aruco reports each marker's center as the average
+         //     of its 4 corners.
+         //
+         // The solver receives the effective dimensions (geometric truth).
+         // The pane's half-extents are derived from the full window
+         // dimensions so the scene's content covers the actual screen rather
+         // than the slightly smaller marker-center rectangle.
          if (!_localMatrix && anchorState.corners && anchorState.frameW && anchorState.frameH) {
+            const effW = anchorState.effectiveWidth  ?? anchorState.width;
+            const effH = anchorState.effectiveHeight ?? anchorState.height;
             const result = _solveAnchorPose(
                anchorState.corners,
                anchorState.frameW, anchorState.frameH,
                anchorState.fl,
-               anchorState.width, anchorState.height,
+               effW, effH,
             );
             if (result) {
                _localMatrix      = result.matrix;
@@ -286,6 +305,13 @@ function _solveAnchorPose(corners, frameW, frameH, fl, width, height) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function _setupMaster(serverURL) {
+
+   // Idempotency guard: if this scene was double-initialized (hot reload,
+   // duplicate import, framework calling init twice, etc), we don't want
+   // to build two control panels, open two popups, or attach two keyboard
+   // listeners. The flag lives on window so it survives module re-imports.
+   if (window.__screenAnchorMasterSetup) return;
+   window.__screenAnchorMasterSetup = true;
 
    // Persistent state for the master: control panel DOM refs, popup window,
    // cast video element, etc. Tucked into a closure object so we can pass
@@ -387,30 +413,56 @@ function _openCalibrationPopup(M) {
    d.body.style.cssText = 'margin:0;padding:0;overflow:hidden;background:#fff;';
    d.title             = 'Screen Anchor Calibration';
 
-   // Compute the ArUco placement in the popup. We pin the marker CENTERS
-   // to the popup corners — that way the rectangle the solver sees in image
-   // space corresponds exactly to the rectangle the user measured with a
-   // ruler (full-popup-window). If we instead inset the markers, the user
-   // would have to measure the inset rectangle, which is harder.
+   // Compute the ArUco placement. The user-facing convention is simple:
+   // WIDTH and HEIGHT in the sliders are the full window dimensions (what
+   // they'd measure with a ruler against the popup's edges). The markers
+   // sit fully inside the popup with a small white "quiet zone" between
+   // each marker and the window corner — the ArUco spec requires this
+   // white margin for reliable detection. Without it, a dark monitor
+   // bezel touching the marker's black squares would fuse visually with
+   // the marker's pattern and degrade detection. The quiet zone gives
+   // the detector a clean white boundary regardless of what's around the
+   // window.
+   //
+   // The solver doesn't see the window or the quiet zone — it sees the
+   // rectangle defined by marker CENTERS. Inside _pollOnce we compute
+   // that rectangle's size in meters by subtracting the appropriate
+   // offset from the user's window-size sliders.
    const popupW   = M.popup.innerWidth;
    const popupH   = M.popup.innerHeight;
-   const markerPx = Math.round(Math.min(popupW, popupH) * 0.10);
-   const half     = Math.round(markerPx / 2);
 
+   // Each marker is 10% of the popup's shorter side, and we place each
+   // one inset by a "quiet zone" of 20% of the marker side — meaning the
+   // marker's outer edge sits quietPx pixels in from the window corner.
+   const markerPx = Math.round(Math.min(popupW, popupH) * 0.10);
+   const quietPx  = Math.round(markerPx * 0.20);
+
+   // Store popup geometry for _pollOnce. The "centerOffsetPx" tells the
+   // poller where the marker centers sit relative to the window corners
+   // (= quietPx + markerPx/2), so it can correctly project that offset
+   // from pixels to meters when computing effectiveWidth/Height.
+   M.popupW         = popupW;
+   M.popupH         = popupH;
+   M.centerOffsetPx = quietPx + markerPx / 2;
+
+   // Marker outer-edge positions (where the white container starts).
+   // Inset by quietPx on each side so the quiet zone lives INSIDE the
+   // window — visible to the cast camera as a guaranteed white border
+   // around the black marker square.
    const corners = [
-      { id: 0, cx: 0,      cy: 0      },  // TL
-      { id: 1, cx: popupW, cy: 0      },  // TR
-      { id: 2, cx: popupW, cy: popupH },  // BR
-      { id: 3, cx: 0,      cy: popupH },  // BL
+      { id: 0, left: quietPx,                       top: quietPx                       },  // TL
+      { id: 1, left: popupW - quietPx - markerPx,   top: quietPx                       },  // TR
+      { id: 2, left: popupW - quietPx - markerPx,   top: popupH - quietPx - markerPx   },  // BR
+      { id: 3, left: quietPx,                       top: popupH - quietPx - markerPx   },  // BL
    ];
 
-   for (const { id, cx, cy } of corners) {
+   for (const { id, left, top } of corners) {
       const img = d.createElement('img');
       img.src = `../media/aruco_markers/aruco_${id}.png`;
       img.style.cssText = [
          'position:fixed',
-         `left:${cx - half}px`,
-         `top:${cy - half}px`,
+         `left:${left}px`,
+         `top:${top}px`,
          `width:${markerPx}px`,
          `height:${markerPx}px`,
          'image-rendering:pixelated',
@@ -450,7 +502,7 @@ function _closeCalibrationPopup(M) {
 function _buildControlPanel(M) {
    const panel = document.createElement('div');
    panel.style.cssText = [
-      'position:fixed', 'top:10px', 'left:10px',
+      'position:fixed', 'top:10px', 'right:10px',
       'width:380px', 'box-sizing:border-box',
       'padding:14px 16px',
       'background:rgba(15,15,15,0.94)', 'color:#ddd',
@@ -676,6 +728,21 @@ async function _pollOnce(M) {
       anchorState.corners = data.corners;
       anchorState.frameW  = M.castCanvas.width;
       anchorState.frameH  = M.castCanvas.height;
+
+      // Compute the rectangle BETWEEN MARKER CENTERS in meters. The user's
+      // sliders give the full window dimensions; the marker centers sit
+      // centerOffsetPx pixels in from each window edge (centerOffsetPx =
+      // quietPx + markerPx/2 — the quiet zone plus half the marker side).
+      // The center-to-center rectangle is therefore smaller than the
+      // window by 2 × centerOffsetPx on each axis. We project that pixel
+      // difference into meters using the window's pixel-to-meter ratio.
+      if (M.popupW && M.popupH && M.centerOffsetPx) {
+         const offsetMetersX = anchorState.width  * (2 * M.centerOffsetPx / M.popupW);
+         const offsetMetersY = anchorState.height * (2 * M.centerOffsetPx / M.popupH);
+         anchorState.effectiveWidth  = anchorState.width  - offsetMetersX;
+         anchorState.effectiveHeight = anchorState.height - offsetMetersY;
+      }
+
       if (typeof server !== 'undefined') {
          server.broadcastGlobal('anchorState');
       }
