@@ -161,10 +161,9 @@ export const init = async model => {
                server.broadcastGlobal('P');
             }
 
-            // CREATE 3D VIEW OF ANY SHAPES THAT ARE ABOVE THE SCREEN.
-            // Logic is identical to transfer.js — shapes that fall outside
-            // the [-1.2..1.2, -1.1..0.4] rectangle in the pane's local
-            // coordinate space float as 3D cubes/spheres in the room.
+            // Shapes dragged outside the screen rectangle appear as 3D objects
+            // in the room at the corresponding world position. Shapes inside
+            // [-1, +1] in both axes are on-screen and handled by the 2D canvas.
 
             while (shapes.nChildren() > 0)
                shapes.remove(0);

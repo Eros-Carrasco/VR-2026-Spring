@@ -100,10 +100,8 @@ let _lastRecalibSeenByHS = -1;
 let _lastLockSeenByHS    = 0;
 
 // ── Focal-length presets ─────────────────────────────────────────────────────
-// Empirically measured for each cast source. Add more here as you encounter
-// them. "Web Cast" is a placeholder — the value is not yet known and the user
-// will tune it with the slider; when they save, the preset is recorded as
-// "Custom" but their tuned value persists.
+// Empirically measured per cast source. Values not listed here default to
+// "Custom" — the user tunes with the slider and the result is saved to JSON.
 const FL_PRESETS = {
    'Meta Quest Developer Hub': 0.340,
    'Web Cast':                 0.340,
@@ -209,7 +207,16 @@ function _tick(isMaster) {
       // uses for P and S, and MRandarin.js uses for mandarinState.
       if (typeof server !== 'undefined') {
          const synced = server.synchronize('anchorState');
-         if (synced) window.anchorState = synced;
+         if (synced) {
+            window.anchorState = synced;
+            // Master hasn't completed calibration this session yet — don't let
+            // stale server state (calibrated:true from last session) skip the
+            // calibration popup. Once the headset locks (_localMatrix set),
+            // we allow calibrated:true to propagate normally.
+            if (isMaster && !_localMatrix) {
+               anchorState.calibrated = false;
+            }
+         }
          if (isMaster) {
             server.broadcastGlobal('anchorState');
          }
@@ -342,6 +349,17 @@ function _setupMaster(serverURL) {
    if (window.__screenAnchorMasterSetup) return;
    window.__screenAnchorMasterSetup = true;
 
+   // Reset calibration state every session. The framework persists anchorState
+   // across reloads via server.synchronize, so without this reset the scene
+   // would think it's already calibrated and skip the popup entirely.
+   // Slider values (fl, width, height) are loaded from screenAnchorConfig.json
+   // below, so we don't need to preserve them here.
+   anchorState.calibrated   = false;
+   anchorState.corners      = null;
+   anchorState.lockCounter  = 0;
+   _localMatrix             = null;
+   _lastLockSeenByHS        = 0;
+
    // Persistent state for the master: control panel DOM refs, popup window,
    // cast video element, etc. Tucked into a closure object so we can pass
    // it around the helpers below without leaking globals.
@@ -364,10 +382,8 @@ function _setupMaster(serverURL) {
       currentPreset:   'Custom',
    };
 
-   // Load persisted config first, so the panel boots with the user's last
-   // calibration values rather than defaults. This is the "option B" we
-   // agreed on: sliders start at last-used values, user can confirm or
-   // recalibrate.
+   // Load persisted config so the panel boots with the user's last-used
+   // values rather than defaults. Calibration itself always runs fresh.
    _loadConfig(serverURL).then(cfg => {
       if (cfg && cfg.exists) {
          anchorState.fl       = cfg.fl;

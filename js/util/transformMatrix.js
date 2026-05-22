@@ -1,3 +1,7 @@
+// 4×4 column-major matrix utilities. All matrices follow the WebGL convention:
+// stored as 16 floats, column first (m[0..3] = column 0, m[4..7] = column 1…).
+// mxm and transform are exported; the rest are available if you import them.
+
 let cos = Math.cos, sin = Math.sin;
 let identity = () => [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
 let move = (x,y,z) => { if (y===undefined) {z=x[2];y=x[1];x=x[0];}
