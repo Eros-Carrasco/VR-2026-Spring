@@ -174,7 +174,13 @@ export const init = async model => {
             // 0.15 = 15 cm in front of the screen surface.
             if (M) {
                const ext = getHalfExtents();
-               const shapeScale = 0.08 / ext.halfX;   // ~8 cm radius in world
+               // Pane's matrix has non-uniform scale: X column × halfX, Y column × halfY,
+               // Z column unscaled. A uniform .scale(s) would inherit that stretch.
+               // Dividing each axis by the parent's scale gives a uniform sphere/cube
+               // of radius r in world space.
+               const r  = 0.08;
+               const sx = r / ext.halfX;
+               const sy = r / ext.halfY;
                for (let n = 0 ; n < S.length ; n++) {
                   let s = S[n];
                   let x =  (s.x - w/2) / (w/2);
@@ -182,7 +188,7 @@ export const init = async model => {
                   if (x < -1 || x > 1 || y < -1 || y > 1)
                      shapes.add(s.type == 0 ? 'cube' : 'sphere')
                            .move(x, y, 0.15)
-                           .scale(shapeScale)
+                           .scale(sx, sy, r)
                            .color(rgb[s.c]);
                }
             }
