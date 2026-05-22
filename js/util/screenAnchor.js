@@ -115,8 +115,8 @@ const FL_PRESETS = {
 // but the tighter range gives much better slider resolution for the common case.
 const FL_MIN     = 0.25;   // ≈ 127° H-FOV — very wide
 const FL_MAX     = 0.60;   // ≈  79° H-FOV — moderately narrow
-const SIZE_MIN_M = 0.20;   // 20 cm — small laptop screen (~11")
-const SIZE_MAX_M = 0.80;   // 80 cm — large desktop monitor (~32")
+const SIZE_MIN_M = 0.10;   // 10 cm — small laptop screen (~11")
+const SIZE_MAX_M = 0.60;   // 60 cm — large desktop monitor (~32")
 
 // ── Backend communication ────────────────────────────────────────────────────
 const DEFAULT_SERVER_URL = 'http://localhost:5050';
@@ -428,14 +428,17 @@ const _AUTO_SAVE_DEBOUNCE_MS = 500;
 
 function _scheduleAutoSave(M) {
    if (M.autoSaveTimer) clearTimeout(M.autoSaveTimer);
-   M.autoSaveTimer = setTimeout(() => {
+   _setStatus(M, 'saving…', '#888');
+   M.autoSaveTimer = setTimeout(async () => {
       M.autoSaveTimer = null;
-      _saveConfig(M.serverURL, {
+      const ok = await _saveConfig(M.serverURL, {
          fl:       anchorState.fl,
          width:    anchorState.width,
          height:   anchorState.height,
          flPreset: M.currentPreset,
       });
+      if (ok) _setStatus(M, '✓ saved', '#0fa');
+      else    _setStatus(M, '⚠ save failed — is the Python server running?', '#f55');
    }, _AUTO_SAVE_DEBOUNCE_MS);
 }
 
