@@ -16,8 +16,11 @@ export const init = async model => {
 
    // Boot the screen-anchor util. On the PC master this opens the
    // calibration popup, builds the control panel, and starts polling the
-   // backend. On the headset it sits in a sync loop waiting for corners.
-   initScreenAnchor(model);
+   // backend. The returned object exposes tick(), which MUST be called at
+   // the top of model.animate so anchorState stays in sync between PC and
+   // headset (window.requestAnimationFrame is paused in immersive WebXR,
+   // so we piggyback on model.animate's XR-driven frame loop instead).
+   const anchor = initScreenAnchor(model);
 
    // ERROR CAPTURE — visible in XR via debugNode, and logged to console
    let errorMsg = '';
@@ -96,6 +99,12 @@ export const init = async model => {
 
    model.animate(() => {
       try {
+         // Sync anchorState first — must run on every client every frame so
+         // the headset sees the corners broadcast from the master and runs
+         // its solve. Same pattern as the P/S syncs below; same pattern
+         // MRandarin.js uses for mandarinState at the top of its animate.
+         anchor.tick();
+
          let cr = h / 32;
          let cx = () => w - h/9;
          let cy = n => (n+.75) * h/9;

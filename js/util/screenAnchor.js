@@ -41,10 +41,11 @@
  *      from "../util/screenAnchor.js";
  *
  *   export const init = async model => {
- *      initScreenAnchor(model);
+ *      const anchor = initScreenAnchor(model);
  *      // … build your scene nodes (a pane, etc.) and keep them hidden
  *      //   until calibration completes …
  *      model.animate(() => {
+ *         anchor.tick();                    // sync state with server
  *         const M = getAnchorMatrix();
  *         if (M) {
  *            const { halfX, halfY } = getHalfExtents();
@@ -87,6 +88,7 @@ window.anchorState = window.anchorState || {
    effectiveHeight: null,    // marker-center-to-marker-center height (m) — what the solver actually sees
    calibrated:      false,   // set true once the headset locks a matrix
    recalibCounter:  0,       // bumped by R-key to force re-solve on all clients
+   lockCounter:     0,       // bumped by the PC's "Lock" button to trigger the solve
 };
 
 // ── Headset-local state (per-client, not synced) ─────────────────────────────
@@ -94,8 +96,8 @@ window.anchorState = window.anchorState || {
 // we cache the result here. Re-solving each frame would re-anchor the matrix
 // to the *current* head pose, which would make the screen "follow" the user.
 let _localMatrix         = null;
-let _localHalfExtents    = null;
 let _lastRecalibSeenByHS = -1;
+let _lastLockSeenByHS    = 0;
 
 // ── Focal-length presets ─────────────────────────────────────────────────────
 // Empirically measured for each cast source. Add more here as you encounter
@@ -108,10 +110,13 @@ const FL_PRESETS = {
 };
 
 // ── Limits for the tuning sliders ────────────────────────────────────────────
-const FL_MIN     = 0.20;   // ≈ 136° H-FOV — sanity floor
-const FL_MAX     = 1.20;   // ≈  45° H-FOV — sanity ceiling
-const SIZE_MIN_M = 0.05;   //  5 cm — tiny phone
-const SIZE_MAX_M = 2.00;   //  2 m  — wall-sized display
+// Sized for "a computer screen" — laptops and desktop monitors. Anyone wanting
+// to anchor to a TV or phone screen will need to widen these bounds in code,
+// but the tighter range gives much better slider resolution for the common case.
+const FL_MIN     = 0.25;   // ≈ 127° H-FOV — very wide
+const FL_MAX     = 0.60;   // ≈  79° H-FOV — moderately narrow
+const SIZE_MIN_M = 0.20;   // 20 cm — small laptop screen (~11")
+const SIZE_MAX_M = 0.80;   // 80 cm — large desktop monitor (~32")
 
 // ── Backend communication ────────────────────────────────────────────────────
 const DEFAULT_SERVER_URL = 'http://localhost:5050';
@@ -125,11 +130,27 @@ const POLL_INTERVAL_MS   = 500;
 /**
  * initScreenAnchor(model, opts) — call once from your scene's init().
  *
- * @param {object} model  the scene root (not used for rendering here, but
- *                        accepted for API symmetry; future versions might
- *                        render the calibration popup as a 3D node).
+ * Returns an object with a single method:
+ *   tick()  — call this at the top of your scene's model.animate callback.
+ *             It synchronizes anchorState with the server, broadcasts (if
+ *             master), and runs the pose solve on the first frame after
+ *             corners arrive.
+ *
+ * Why a manual tick instead of an internal rAF loop: window.requestAnimationFrame
+ * is paused during immersive WebXR sessions on Quest, but the framework's
+ * model.animate is driven by xrSession.requestAnimationFrame and keeps
+ * ticking. To make the same util work on the PC (no XR) and the headset
+ * (in XR), we hook into model.animate via the scene, which guarantees the
+ * sync runs on every visible frame on both clients. This matches the
+ * pattern used by MRandarin.js (server.synchronize at the top of animate).
+ *
+ * @param {object} model  the scene root (accepted for API symmetry; future
+ *                        versions might render the calibration popup as a
+ *                        3D node).
  * @param {object} opts
  *   serverURL  {string}  Python backend base URL. Default: http://localhost:5050
+ *
+ * @returns {{tick: function}}
  */
 export function initScreenAnchor(model, opts = {}) {
 
@@ -142,11 +163,9 @@ export function initScreenAnchor(model, opts = {}) {
       _setupMaster(serverURL);
    }
 
-   // Both master and non-master clients need to sync state every frame.
-   // We hook this into the rAF cycle directly rather than asking the scene
-   // to call us — that way the consumer just calls getAnchorMatrix() and
-   // doesn't need to worry about ticking us.
-   _startSyncLoop(isMaster);
+   return {
+      tick: () => _tick(isMaster),
+   };
 }
 
 /**
@@ -163,83 +182,93 @@ export function getAnchorMatrix() {
  * Returns the real-world half-width and half-height of the screen rectangle
  * in meters, for sizing scene nodes anchored to the screen.
  *
+ * Reads directly from anchorState every call rather than caching at lock
+ * time, so the user can fine-tune width/height with the sliders after
+ * calibration and the change takes effect immediately. (The pose matrix
+ * itself stays locked — see _tick — but the size is just a scale factor
+ * applied to that matrix, so it's safe to vary in real time.)
+ *
  * @returns {{halfX: number, halfY: number}|null}  or null before calibration
  */
 export function getHalfExtents() {
-   return _localHalfExtents;
+   if (!_localMatrix) return null;
+   return {
+      halfX: anchorState.width  / 2,
+      halfY: anchorState.height / 2,
+   };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// INTERNAL — sync loop (runs on every client)
+// INTERNAL — per-frame sync (called by the scene's model.animate)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function _startSyncLoop(isMaster) {
-   const tick = () => {
-      try {
-         // Pull shared state from the server, then (if master) push it back.
-         // The master writes; other clients read. This mirrors the pattern
-         // transfer.js uses for P and S.
-         const synced = (typeof server !== 'undefined')
-            ? server.synchronize('anchorState')
-            : null;
+function _tick(isMaster) {
+   try {
+      // Pull shared state from the server, then (if master) push it back.
+      // The master writes; other clients read. Same pattern transfer.js
+      // uses for P and S, and MRandarin.js uses for mandarinState.
+      if (typeof server !== 'undefined') {
+         const synced = server.synchronize('anchorState');
          if (synced) window.anchorState = synced;
-         if (isMaster && typeof server !== 'undefined') {
+         if (isMaster) {
             server.broadcastGlobal('anchorState');
          }
+      }
 
-         // Re-solve when recalibCounter advances (master pressed R)
-         if (anchorState.recalibCounter !== _lastRecalibSeenByHS) {
-            _lastRecalibSeenByHS = anchorState.recalibCounter;
-            _localMatrix         = null;
-            _localHalfExtents    = null;
-         }
+      // Re-solve when recalibCounter advances (master pressed R)
+      if (anchorState.recalibCounter !== _lastRecalibSeenByHS) {
+         _lastRecalibSeenByHS = anchorState.recalibCounter;
+         _localMatrix         = null;
+      }
 
-         // First-time solve on this client (typically the headset) once we
-         // see corners. The matrix is then frozen in world space.
-         //
-         // Two distinct sizes are at play here, and the distinction matters:
-         //   - `width` / `height` are the FULL WINDOW dimensions (what the
-         //     user typed into the sliders, what they'd measure with a ruler
-         //     against the popup's outer edges).
-         //   - `effectiveWidth` / `effectiveHeight` are the rectangle between
-         //     ArUco CENTERS — smaller than the window by one marker side on
-         //     each axis. This is what the solver actually sees in the image,
-         //     because cv2.aruco reports each marker's center as the average
-         //     of its 4 corners.
-         //
-         // The solver receives the effective dimensions (geometric truth).
-         // The pane's half-extents are derived from the full window
-         // dimensions so the scene's content covers the actual screen rather
-         // than the slightly smaller marker-center rectangle.
-         if (!_localMatrix && anchorState.corners && anchorState.frameW && anchorState.frameH) {
-            const effW = anchorState.effectiveWidth  ?? anchorState.width;
-            const effH = anchorState.effectiveHeight ?? anchorState.height;
-            const result = _solveAnchorPose(
-               anchorState.corners,
-               anchorState.frameW, anchorState.frameH,
-               anchorState.fl,
-               effW, effH,
-            );
-            if (result) {
-               _localMatrix      = result.matrix;
-               _localHalfExtents = { halfX: anchorState.width / 2, halfY: anchorState.height / 2 };
+      // Solve ONLY when the master clicks "Lock" — not automatically on
+      // every frame that corners are visible. Locking-on-corner-detection
+      // produces a pose anchored to whatever head pose the user happened
+      // to have at that random moment; explicit locking lets the user
+      // hold still, frame the screen well in their view, and then commit.
+      //
+      // Two distinct sizes are at play here, and the distinction matters:
+      //   - `width` / `height` are the FULL WINDOW dimensions (what the
+      //     user typed into the sliders, what they'd measure with a ruler
+      //     against the popup's outer edges).
+      //   - `effectiveWidth` / `effectiveHeight` are the rectangle between
+      //     ArUco CENTERS — smaller than the window by one marker side on
+      //     each axis. This is what the solver actually sees in the image,
+      //     because cv2.aruco reports each marker's center as the average
+      //     of its 4 corners.
+      //
+      // The solver receives the effective dimensions (geometric truth).
+      // The pane's half-extents are derived from the full window
+      // dimensions so the scene's content covers the actual screen rather
+      // than the slightly smaller marker-center rectangle.
+      const lock = anchorState.lockCounter || 0;
+      if (lock !== _lastLockSeenByHS && !_localMatrix &&
+          anchorState.corners && anchorState.frameW && anchorState.frameH) {
+         _lastLockSeenByHS = lock;
+         const effW = anchorState.effectiveWidth  ?? anchorState.width;
+         const effH = anchorState.effectiveHeight ?? anchorState.height;
+         const result = _solveAnchorPose(
+            anchorState.corners,
+            anchorState.frameW, anchorState.frameH,
+            anchorState.fl,
+            effW, effH,
+         );
+         if (result) {
+            _localMatrix = result.matrix;
 
-               // Tell the master that this client (presumably the headset)
-               // has locked. The master uses this to close the popup.
-               if (!anchorState.calibrated) {
-                  anchorState.calibrated = true;
-                  if (isMaster && typeof server !== 'undefined') {
-                     server.broadcastGlobal('anchorState');
-                  }
+            // Tell the master that this client (presumably the headset)
+            // has locked. The master uses this to close the popup.
+            if (!anchorState.calibrated) {
+               anchorState.calibrated = true;
+               if (isMaster && typeof server !== 'undefined') {
+                  server.broadcastGlobal('anchorState');
                }
             }
          }
-      } catch (e) {
-         console.warn('[screenAnchor] sync tick error:', e);
       }
-      requestAnimationFrame(tick);
-   };
-   requestAnimationFrame(tick);
+   } catch (e) {
+      console.warn('[screenAnchor] tick error:', e);
+   }
 }
 
 /**
@@ -383,6 +412,31 @@ async function _saveConfig(serverURL, payload) {
       console.warn('[screenAnchor] save_config failed:', e);
       return false;
    }
+}
+
+// Debounced auto-save: called every time a slider moves or a preset is
+// clicked. The save itself is deferred ~500ms after the last change so we
+// don't pummel the server with one POST per slider tick. Whenever a new
+// change comes in, the pending save is cancelled and re-scheduled — only
+// the latest values get written.
+//
+// This is the mechanism that lets the user's tuning survive between
+// sessions WITHOUT requiring a full headset-lock to trigger persistence.
+// (The headset-lock save also still runs, but it's now a redundant
+// safety net rather than the only path.)
+const _AUTO_SAVE_DEBOUNCE_MS = 500;
+
+function _scheduleAutoSave(M) {
+   if (M.autoSaveTimer) clearTimeout(M.autoSaveTimer);
+   M.autoSaveTimer = setTimeout(() => {
+      M.autoSaveTimer = null;
+      _saveConfig(M.serverURL, {
+         fl:       anchorState.fl,
+         width:    anchorState.width,
+         height:   anchorState.height,
+         flPreset: M.currentPreset,
+      });
+   }, _AUTO_SAVE_DEBOUNCE_MS);
 }
 
 // ── Calibration popup ────────────────────────────────────────────────────────
@@ -552,7 +606,16 @@ function _buildControlPanel(M) {
          <div data-role="flPresets" style="margin-top:6px;font-size:11px;"></div>
       </div>
 
-      <div style="margin-top:14px;display:flex;gap:8px;">
+      <div style="margin-top:14px;">
+         <button data-role="lock" disabled
+                 style="width:100%;padding:10px;font:13px monospace;
+                        background:#444;color:#888;border:0;border-radius:4px;
+                        cursor:not-allowed;font-weight:bold;">
+            🔒 Lock Calibration
+         </button>
+      </div>
+
+      <div style="margin-top:8px;display:flex;gap:8px;">
          <button data-role="capture"
                  style="flex:1;padding:8px;font:13px monospace;
                         background:#0af;color:#000;border:0;border-radius:4px;
@@ -576,6 +639,7 @@ function _buildControlPanel(M) {
    M.heightValue  = panel.querySelector('[data-role="heightValue"]');
    M.flSlider     = panel.querySelector('[data-role="flSlider"]');
    M.flValue      = panel.querySelector('[data-role="flValue"]');
+   M.lockBtn      = panel.querySelector('[data-role="lock"]');
 
    // Initialize slider values from anchorState (which was just hydrated
    // from the saved JSON in _loadConfig, if any).
@@ -606,25 +670,32 @@ function _buildControlPanel(M) {
          M.currentPreset = name;
          _refreshSliderLabels(M);
          _highlightActivePreset(M);
+         _scheduleAutoSave(M);
       });
       presetContainer.appendChild(btn);
    }
 
    // Slider event handlers. Any movement transitions the FL preset to
    // "Custom" since the user has manually overridden the preset value.
+   // Every change also schedules an auto-save (debounced) so the user's
+   // tuned values survive the next session — without forcing them to
+   // complete a full headset lock to get persistence.
    M.widthSlider.addEventListener('input', () => {
       anchorState.width = parseFloat(M.widthSlider.value);
       _refreshSliderLabels(M);
+      _scheduleAutoSave(M);
    });
    M.heightSlider.addEventListener('input', () => {
       anchorState.height = parseFloat(M.heightSlider.value);
       _refreshSliderLabels(M);
+      _scheduleAutoSave(M);
    });
    M.flSlider.addEventListener('input', () => {
       anchorState.fl  = parseFloat(M.flSlider.value);
       M.currentPreset = 'Custom';
       _refreshSliderLabels(M);
       _highlightActivePreset(M);
+      _scheduleAutoSave(M);
    });
 
    // Buttons
@@ -633,6 +704,18 @@ function _buildControlPanel(M) {
    });
    panel.querySelector('[data-role="recalib"]').addEventListener('click', () => {
       _recalibrate(M);
+   });
+   M.lockBtn.addEventListener('click', () => {
+      // Bump the lock counter — the headset's tick() picks this up next
+      // frame and runs the pose solve using its current inverseViewMatrix(0)
+      // + the most recent broadcasted corners. The button is disabled
+      // until corners actually arrive, so by the time it's clickable we
+      // know there's something valid to solve from.
+      anchorState.lockCounter = (anchorState.lockCounter || 0) + 1;
+      if (typeof server !== 'undefined') {
+         server.broadcastGlobal('anchorState');
+      }
+      _setStatus(M, '🔒 Lock requested. Waiting for headset to solve…', '#0af');
    });
 
    _highlightActivePreset(M);
@@ -746,7 +829,8 @@ async function _pollOnce(M) {
       if (typeof server !== 'undefined') {
          server.broadcastGlobal('anchorState');
       }
-      _setStatus(M, '✅ Markers detected. Waiting for headset to lock…', '#0fa');
+      _setStatus(M, '✅ Markers detected. Click "Lock Calibration" when headset is aimed.', '#0fa');
+      _setLockButtonEnabled(M, true);
 
       // Did the headset confirm lock? (The headset sets calibrated=true
       // after its own successful solve.) If yes, persist config and close
@@ -761,12 +845,28 @@ async function _pollOnce(M) {
          _closeCalibrationPopup(M);
          clearInterval(M.pollTimer);
          M.pollTimer = null;
+         _setLockButtonEnabled(M, false);
          _setStatus(M, '✅ Calibrated and saved. Press R to recalibrate.', '#0fa');
       }
    } else {
       _setStatus(M,
          `Searching… markers seen: ${data.n ?? '?'} / 4`,
          '#fa0');
+      _setLockButtonEnabled(M, false);
+   }
+}
+
+function _setLockButtonEnabled(M, enabled) {
+   if (!M.lockBtn) return;
+   M.lockBtn.disabled = !enabled;
+   if (enabled) {
+      M.lockBtn.style.background = '#0f8';
+      M.lockBtn.style.color      = '#000';
+      M.lockBtn.style.cursor     = 'pointer';
+   } else {
+      M.lockBtn.style.background = '#444';
+      M.lockBtn.style.color      = '#888';
+      M.lockBtn.style.cursor     = 'not-allowed';
    }
 }
 
@@ -776,11 +876,11 @@ function _recalibrate(M) {
    anchorState.calibrated      = false;
    anchorState.corners         = null;
    anchorState.recalibCounter += 1;
-   _localMatrix      = null;
-   _localHalfExtents = null;
+   _localMatrix = null;
    if (typeof server !== 'undefined') {
       server.broadcastGlobal('anchorState');
    }
+   _setLockButtonEnabled(M, false);
    _openCalibrationPopup(M);
 
    // Restart polling if we have a capture stream already.

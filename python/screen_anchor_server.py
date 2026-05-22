@@ -45,7 +45,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
-from vision_tracker import detect_aruco, order_corners, is_valid_quad
+from aruco_detector import detect_aruco, order_corners, is_valid_quad
 
 # Config file lives at the project root, next to other state JSONs
 # (clientDataMessages.json, ballInfo.json, etc.). The path is computed
