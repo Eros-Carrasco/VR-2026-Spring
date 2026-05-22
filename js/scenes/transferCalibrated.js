@@ -50,7 +50,7 @@ export const init = async model => {
       // Park out of sight until we have a calibration matrix to apply.
       pane.setMatrix([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,-999,0,1]);
 
-      shapes    = model.add();
+      shapes    = pane.add();
       debugNode = model.add();
    }
    else {
@@ -169,19 +169,23 @@ export const init = async model => {
             while (shapes.nChildren() > 0)
                shapes.remove(0);
 
-            for (let n = 0 ; n < S.length ; n++) {
-               let s = S[n];
-               let x =  (s.x - w/2 - 130) / (w/2);
-               let y = -(s.y - h/2 + 150) / (w/2);
-               if (y < -1.1 || y > .4 || x < -1.2 || x > 1.2)
-                  shapes.add(s.type == 0 ? 'cube' : 'sphere')
-                        .move(0,.95,0)
-                        .scale(.13)
-                        .turnX(-.3)
-                        .move(x,y,0)
-                        .turnX(.3)
-                        .scale(.085)
-                        .color(rgb[s.c]);
+            // Shapes are children of pane, so coords are pane-local:
+            // x,y ∈ [-1, +1] map to the screen's physical edges (halfX/halfY
+            // are already baked into pane's matrix rows). Z is unscaled so
+            // 0.15 = 15 cm in front of the screen surface.
+            if (M) {
+               const ext = getHalfExtents();
+               const shapeScale = 0.08 / ext.halfX;   // ~8 cm radius in world
+               for (let n = 0 ; n < S.length ; n++) {
+                  let s = S[n];
+                  let x =  (s.x - w/2) / (w/2);
+                  let y = -(s.y - h/2) / (h/2);
+                  if (x < -1 || x > 1 || y < -1 || y > 1)
+                     shapes.add(s.type == 0 ? 'cube' : 'sphere')
+                           .move(x, y, 0.15)
+                           .scale(shapeScale)
+                           .color(rgb[s.c]);
+               }
             }
          }
          else {
