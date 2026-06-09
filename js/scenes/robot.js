@@ -25,8 +25,8 @@ export const init = async model => {
 
    window.I = [0,0,0,0,0, 0,0,0,0,0];
    window.cg = new Matrix();
-   cg.draw = (shape, color) => {
-      model.add(shape).setMatrix(cg.getValue()).scale(1,1,zsgn).color(color);
+   cg.draw = (shape, color, scale) => {
+      model.add(shape).setMatrix(cg.getValue()).scale(scale ?? 1).scale(1,1,zsgn).color(color);
       return cg;
    }
    cg.move     = cg.translate;
@@ -39,19 +39,21 @@ export const init = async model => {
    window.ball = 'sphere';
    window.cube = 'cube';
    window.tube = 'tubeZ';
+   window.tubey = 'tubeY';
    window.zsgn = clientID == clients[0] ? 1 : -1;
 
-/*
    // THE MORE EFFICIENT WEBRTC APPROACH IS NOT YET WORKING
 
    let channel = new Channel(), id;
    getFile('bici/projects/0423/src/webrtc_id.cg', id => channel.open(id));
    channel.onReceive(msg => {
+      console.log('--------------', msg);
+/*
       let data = msg.split(',');
       for (let i = 0 ; i < data.length ; i++)
          I[i] = parseInt(data[i]) / 100;
-   });
 */
+   });
 
    let I0 = [0,0,0,0,0, 0,0,0,0,0];
    let dI = [0,0,0,0,0, 0,0,0,0,0];
