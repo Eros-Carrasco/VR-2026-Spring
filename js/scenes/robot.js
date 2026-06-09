@@ -42,17 +42,14 @@ export const init = async model => {
    window.tubey = 'tubeY';
    window.zsgn = clientID == clients[0] ? 1 : -1;
 
-   // THE MORE EFFICIENT WEBRTC APPROACH IS NOT YET WORKING
+   // USE WEBRTC TO GET REAL-TIME PARAMETER VALUES FROM BICI
 
    let channel = new Channel(), id;
    getFile('bici/projects/0423/src/webrtc_id.cg', id => channel.open(id));
    channel.onReceive(msg => {
-      console.log('--------------', msg);
-/*
       let data = msg.split(',');
-      for (let i = 0 ; i < data.length ; i++)
-         I[i] = parseInt(data[i]) / 100;
-*/
+      for (let i = 0 ; i < 3 ; i++)
+         I[i] = 2 * parseInt(data[i]) / 100 - 1;
    });
 
    let I0 = [0,0,0,0,0, 0,0,0,0,0];
@@ -62,23 +59,12 @@ export const init = async model => {
 
    model.animate(() => {
 
-      // GET MODEL FROM bici
+      // GET THE ROBOT MODEL FROM bici
 
       getFile('bici/projects/0423/src/robot.cg', text => robot = text);
 
       if (robot) {
          let fn = new Function(replaceAtSigns(robot));
-
-	 // GET MOVEMENT FROM bici
-
-         getFile('bici/projects/0423/src/robot_data.cg', text => robot_data = text);
-
-	 if (robot_data) {
-	    let data = robot_data.split(',');
-	    for (let i = 0 ; i < 3 ; i++)
-	       I[i] = 2 * parseInt(data[i]) / 100 - 1;
-         }
-
          while (model.nChildren() > 0)
             model.remove(0);
          cg.identity().move(0,1.5,0).scale(.3,.3,.3*window.zsgn);
