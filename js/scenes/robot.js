@@ -21,8 +21,6 @@ let replaceAtSigns = src => {
 }
 
 export const init = async model => {
-   let robot, robot_data;
-
    window.I = [0,0,0,0,0, 0,0,0,0,0];
    window.cg = new Matrix();
    cg.draw = (shape, color, scale) => {
@@ -49,29 +47,35 @@ export const init = async model => {
    channel.onReceive(msg => {
       switch (msg.type) {
       case 'I':
-         let data = msg.data.split(',');
-         for (let i = 0 ; i < 3 ; i++)
-            I[i] = 2 * parseInt(data[i]) / 100 - 1;
+         I_data = msg.data;
          break;
       }
    });
 
-   let I0 = [0,0,0,0,0, 0,0,0,0,0];
-   let dI = [0,0,0,0,0, 0,0,0,0,0];
-
-   let counter = 0, cI = 3;
+   let robot, counter = 0, I_data = null;
 
    model.animate(() => {
 
       // GET THE ROBOT MODEL FROM bici
 
-      getFile('bici/projects/0423/src/robot.cg', text => robot = text);
+      if (counter++ == 0)
+         getFile('bici/projects/0423/src/robot.cg', text => robot = text);
 
       if (robot) {
+
+         if (I_data) {
+            let data = I_data.split(',');
+
+            for (let i = 0 ; i < 3 ; i++)
+               I[i] = 2 * parseInt(data[i]) / 100 - 1;
+            I_data = null;
+         }
+
          let fn = new Function(replaceAtSigns(robot));
          while (model.nChildren() > 0)
             model.remove(0);
          cg.identity().move(0,1.5,0).scale(.3,.3,.3*window.zsgn);
+
          fn();
       }
    });
