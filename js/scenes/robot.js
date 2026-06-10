@@ -47,9 +47,13 @@ export const init = async model => {
    let channel = new Channel(), id;
    getFile('bici/projects/0423/src/webrtc_id.cg', id => channel.open(id));
    channel.onReceive(msg => {
-      let data = msg.split(',');
-      for (let i = 0 ; i < 3 ; i++)
-         I[i] = 2 * parseInt(data[i]) / 100 - 1;
+      switch (msg.type) {
+      case 'I':
+         let data = msg.data.split(',');
+         for (let i = 0 ; i < 3 ; i++)
+            I[i] = 2 * parseInt(data[i]) / 100 - 1;
+         break;
+      }
    });
 
    let I0 = [0,0,0,0,0, 0,0,0,0,0];
