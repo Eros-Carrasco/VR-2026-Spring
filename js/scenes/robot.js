@@ -1,6 +1,8 @@
 import { Matrix, noise } from '../render/core/cg.js';
 import { Channel } from '../render/core/channel.js';
 
+let useWebRTC = false;
+
 async function getFile(file, callback) {
     try {
         const response = await fetch(file);
@@ -42,17 +44,19 @@ export const init = async model => {
 
    // USE WEBRTC TO GET REAL-TIME PARAMETER VALUES FROM BICI
 
-   let channel = new Channel(), id;
-   getFile('bici/projects/0423/src/webrtc_id.cg', id => channel.open(id));
-   channel.onReceive(msg => {
-      switch (msg.type) {
-      case 'I':
-         I_data = msg.data;
-         break;
-      }
-   });
+   if (useWebRTC) {
+      let channel = new Channel(), id;
+      getFile('bici/projects/0423/src/webrtc_id.cg', id => channel.open(id));
+      channel.onReceive(msg => {
+         switch (msg.type) {
+         case 'I':
+            I_data = msg.data;
+            break;
+         }
+      });
+   }
 
-   let robot, counter = 0, I_data = null;
+   let robot, robot_data, counter = 0, I_data = null;
 
    model.animate(() => {
 
@@ -63,13 +67,23 @@ export const init = async model => {
 
       if (robot) {
 
-         if (I_data) {
-            let data = I_data.split(',');
+         if (useWebRTC) {
+            if (I_data) {
+               let data = I_data.split(',');
 
-            for (let i = 0 ; i < 3 ; i++)
-               I[i] = 2 * parseInt(data[i]) / 100 - 1;
-            I_data = null;
+               for (let i = 0 ; i < 3 ; i++)
+                  I[i] = 2 * parseInt(data[i]) / 100 - 1;
+               I_data = null;
+            }
          }
+	 else {
+            getFile('bici/projects/0423/src/robot_data.cg', text => robot_data = text);
+            if (robot_data) {
+               let data = robot_data.split(',');
+               for (let i = 0 ; i < 3 ; i++)
+                  I[i] = 2 * parseInt(data[i]) / 100 - 1;
+            }     
+	 }
 
          let fn = new Function(replaceAtSigns(robot));
          while (model.nChildren() > 0)
