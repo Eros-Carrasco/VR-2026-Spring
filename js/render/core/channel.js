@@ -22,8 +22,12 @@ export function Channel() {                      // DIRECT DATA CHANNEL BETWEEN 
           stats.forEach(s => {                   // is the first thing to know when a path
              if (s.type == 'candidate-pair' && s.nominated && s.state == 'succeeded') {
                 let l = S[s.localCandidateId], r = S[s.remoteCandidateId];
-                if (l && r)
-                   log('PATH:', l.candidateType + '/' + l.protocol, '->', r.candidateType);
+                if (l && r)                      // The addresses matter as much as the
+                   log('PATH:',                  // type: they reveal when ICE picked an
+                       l.candidateType + '/' + l.protocol,                // odd interface
+                       (l.address || l.ip || '?') + ':' + l.port, '->',  // (IPv6, VPN,
+                       r.candidateType,                                  // AWDL) for one
+                       (r.address || r.ip || '?') + ':' + r.port);       // peer pairing.
              }                                   // works briefly and then dies.
           });
        }).catch(() => {});
@@ -79,6 +83,8 @@ export function Channel() {                      // DIRECT DATA CHANNEL BETWEEN 
           reportPath(pc);                        // connection.
           pc.oniceconnectionstatechange = () => {
              log('ICE STATE:', pc.iceConnectionState);
+             if (pc.iceConnectionState == 'disconnected')
+                reportPath(pc);                  // Show which route was active at death.
              if (! conns.includes(c))
                 return;
              if (pc.iceConnectionState == 'failed' || pc.iceConnectionState == 'closed')
@@ -104,8 +110,10 @@ export function Channel() {                      // DIRECT DATA CHANNEL BETWEEN 
     setupPeer();
     let pad = 'x'.repeat(300);                   // Four times per second, each side sends a
     setInterval(() => {                          // padded heartbeat. Standalone headsets put
-       if (conns.length == 0)                    // their wifi radio to sleep between sparse
-          return;                                // small packets, which kills the connection
+       if (conns.length == 0) {                  // their wifi radio to sleep between sparse
+          lastHeard = Date.now();                // small packets, which kills the connection
+          return;                                // (while there is no connection, silence
+       }                                         // is expected, so keep the clock fresh).
        sendStr(JSON.stringify({ type: '_hb', pad })); // seconds after each handshake burst,
        let silent = Date.now() - lastHeard;      // so keep the link busy enough to stay
        if (silent > 5000 && Date.now() - lastWarn > 5000) {  // awake. It also proves to the
