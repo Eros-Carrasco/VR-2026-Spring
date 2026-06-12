@@ -62,8 +62,7 @@ export const init = async model => {
 
       // GET THE ROBOT MODEL FROM bici
 
-      if (counter++ == 0)
-         getFile('bici/projects/0423/src/robot.cg', text => robot = text);
+      getFile('bici/projects/0423/src/robot.cg', text => robot = text);
 
       if (robot) {
 
