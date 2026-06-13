@@ -3,7 +3,7 @@ import { Channel } from '../render/core/channel.js';
 
 let useWebRTC = false;
 
-let isGreenScreen = true;
+let isGreenScreen = false;
 
 async function getFile(file, callback) {
     try {
@@ -60,6 +60,8 @@ export const init = async model => {
 
    let robot, robot_data, counter = 0, I_data = null;
 
+   inputEvents.onRelease = hand => isGreenScreen = ! isGreenScreen;
+
    model.animate(() => {
 
       // GET THE ROBOT MODEL FROM bici
@@ -92,7 +94,7 @@ export const init = async model => {
          cg.identity().move(0,1.5,0).scale(.3,.3,.3*window.zsgn);
 
          if (isGreenScreen)
-            model.add('square').move(0,1.5,-.5).scale(2).color(0,1,0).dull();
+            model.add('square').move(0,1.5,-1).scale(10).color(0,1,0).dull();
 
          fn();
       }
