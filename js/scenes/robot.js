@@ -3,6 +3,8 @@ import { Channel } from '../render/core/channel.js';
 
 let useWebRTC = false;
 
+let isGreenScreen = true;
+
 async function getFile(file, callback) {
     try {
         const response = await fetch(file);
@@ -88,6 +90,9 @@ export const init = async model => {
          while (model.nChildren() > 0)
             model.remove(0);
          cg.identity().move(0,1.5,0).scale(.3,.3,.3*window.zsgn);
+
+         if (isGreenScreen)
+            model.add('square').move(0,1.5,-.5).scale(2).color(0,1,0).dull();
 
          fn();
       }
