@@ -60,7 +60,10 @@ export const init = async model => {
 
    let robot, robot_data, counter = 0, I_data = null;
 
-   inputEvents.onRelease = hand => isGreenScreen = ! isGreenScreen;
+   inputEvents.onRelease = hand => {
+      if (hand == 'left')
+         isGreenScreen = ! isGreenScreen;
+   }
 
    model.animate(() => {
 
