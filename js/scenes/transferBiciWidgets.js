@@ -68,7 +68,8 @@ export const init = async model => {
    let nextSlot = 10;                        // texture slots for g2 mode (one per card)
 
    const CODE_BOX_OPACITY = 0.85;            // editor transparency (1 = opaque)
-   const CARD_TINT = [.7, .7, 1.1];            // multiply tint on card faces (cools the warm lighting)
+   //const CARD_TINT = [.7, .7, 1.1];            // multiply tint on card faces (cools the warm lighting)
+   const CARD_TINT = [1.1, 1.1, 1.5];            // multiply tint on card faces (cools the warm lighting)
 
    const GRAB_R    = 0.16;  // reach within 16 cm and pinch to grab a card
    const DAMP      = 0.95;  // velocity kept per 1/60 s while flying (eases to rest)
