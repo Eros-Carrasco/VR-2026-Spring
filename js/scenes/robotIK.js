@@ -20,31 +20,35 @@ export const init = async model => {
    }
 
    inputEvents.onDrag = hand => {
-      if (hand == 'right')
+      //if (hand == 'right')
          W = cg.scale(cg.subtract(inputEvents.pos(hand), offset), 1/scale);
    }
 
    inputEvents.onRelease = hand => {
+/*
       if (hand == 'left')
          isGreenScreen = ! isGreenScreen;
+*/
    }
 
-   let greenScreen = model.add('square').color(0,1,0).dull();
+   //model.add('cube').move(0,1.5,-3).color(.2,.3,.5).scale(.5,1.5,1);
 
-   model.add('tubeY').move(0,-.24,0).scale(.2,.1,.2);
+   let greenScreen = model.add('square').color(0,1,0).dull();
 
    let shoulder = model.add();
    shoulder.add('tubeZ').scale(.14).color(0,.5,1);
 
-   let upperArm = model.add('cube').color(.5,.5,.5);;
-
    let elbow = model.add();
    elbow.add('tubeZ').scale(.13).color(.5,.4,0);
 
-   let lowerArm = model.add('cube').color(.5,.5,.5);
-
    let wrist = model.add();
    wrist.add('sphere').scale(.12).color(1,0,0);
+
+   model.add('tubeY').move(0,-.24,0).scale(.2,.1,.2);
+
+   let upperArm = model.add('cube').color(.5,.5,.5);;
+   let lowerArm = model.add('cube').color(.5,.5,.5);
+
 
    let L1 = .65, L2 = .8;
 
@@ -58,7 +62,7 @@ export const init = async model => {
 
       let yaw = W[0] == 0 ? 0 : Math.atan2(W[2], sgn * W[0]);
 
-      model.identity().move(offset).turnY(yaw).scale(scale);
+      model.opacity(.8).identity().move(offset).turnY(yaw).scale(scale);
 
       W = [sgn * Math.sqrt(W[0]*W[0] + W[2]*W[2]), W[1], 0];
 
