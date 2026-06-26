@@ -237,7 +237,7 @@ export function ClientStateSharing() {                                          
             clientData[clientID][hand].fingers = msg.fingers;                    // Set my finger data immediately. //
             message(msg);                                                        //                                 //
          }                                                                       //                                 //
-                                                                                 //                                 //
+/*                                                                                 //                                 //
          if (clientState.pinch(clientID, 'left' , 2) &&                          // If a client does a pinch(2)     //
              clientState.pinch(clientID, 'right', 2)) {                          // gesture with both hands, then   //
             let d = cg.distance(clientState.finger(clientID, 'left' , 1),        // teleport their hands or their   //
@@ -247,7 +247,7 @@ export function ClientStateSharing() {                                          
 	    clay.handsWidget.setVisible(dist > 0);                               // two virtual ping pong balls.    //
             handP = cg.scale(m.slice(8,11), -5 * dist);                          //                                 //
          }                                                                       //                                 //
-                                                                                 //                                 //
+*/                                                                                 //                                 //
          if (previousAudioVolume < .1 && audioVolume >= .1)                      // Whenever a user wearing an XR   //
             message({ speaking: true });                                         // headset starts to speak, send a //
          previousAudioVolume = audioVolume;                                      // message to indicate that.       //
